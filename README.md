@@ -63,11 +63,12 @@ The database schema is described [here](doc/schema.md).
 
 ## Testing
 
-`contrib/regtest_smoke.py` starts a throwaway Bitcoin Core 32.1 regtest node and the binary you
+`contrib/regtest_smoke.py` starts a throwaway Bitcoin Core 32.1.0 regtest node and the binary you
 built, builds a history for one address, and calls every Electrum method our clients use — plus
 `blockchain.scripthash.get_history_paged` in every shape it accepts, and the
-`index_lookup_limit` refusal. Its expectations are cross-checked against bitcoind itself, so it
-fails if the index and the node disagree:
+`index_lookup_limit` refusal at its boundary (a history of exactly `limit` entries is served,
+`limit + 1` is refused, on the exact JSON-RPC code and message). Its expectations are cross-checked
+against bitcoind itself, so it fails if the index and the node disagree:
 
 ```
 cargo build --locked --release
@@ -75,9 +76,9 @@ python3 contrib/regtest_smoke.py --bitcoind-dir ~/core-releases/32.1/bitcoin-32.
     target/release/electrs
 ```
 
-It needs Bitcoin Core 32.1 (`bitcoin-32.1-x86_64-linux-gnu.tar.gz`, unpacked anywhere; pass
-`--bitcoind-dir` or set `BITCOIND_DIR`). Datadirs are temporary and the ports are only used by this
-script, so it never touches a running node.
+It needs Bitcoin Core 32.1.0 exactly (`bitcoin-32.1-x86_64-linux-gnu.tar.gz`, unpacked anywhere;
+pass `--bitcoind-dir` or set `BITCOIND_DIR`). Datadirs are temporary and the ports are only used by
+this script, so it never touches a running node.
 
 ## Contributing
 

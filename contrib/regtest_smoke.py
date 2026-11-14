@@ -5,10 +5,12 @@ Starts a throwaway bitcoind 32.1 (regtest) and the electrs binary under test on 
 database, builds a history for one address (18 payments over 6 blocks, 6 spends, then one
 unconfirmed payment), and calls every method the Blocknil wallet core, the push relay and
 the Clearblock backend use -- plus ``blockchain.scripthash.get_history_paged`` in every
-shape it accepts. It then restarts electrs with ``--index-lookup-limit 5`` to check that an
-over-limit address is refused, that the refusal is a plain JSON-RPC error (not a hang), that
-the server still answers ``server.ping`` afterwards, that a small address is still served,
-and that the paged method is not affected by the limit.
+shape it accepts. It then restarts electrs with ``--index-lookup-limit`` at the boundary (a
+history of exactly ``limit`` entries is SERVED) and one below it (the same history is
+``limit + 1`` candidates and REFUSED), then at 5, and checks that each refusal is a plain
+JSON-RPC error with code 1 and one exact message -- clients may match on it -- that the
+server still answers ``server.ping`` afterwards, that a small address is still served, and
+that the paged method is not affected by the limit.
 
 Expectations are cross-checked against bitcoind itself (every block's transactions with
 prevouts, ``getblock ... 3``), not against electrs' own other methods, so a change that
@@ -17,9 +19,11 @@ breaks both the paged and the unpaged history still fails here.
 Nothing talks to a real server: a temporary datadir, a temporary electrs db, and ports that
 are only used here (override with the SMOKE_* environment variables if they are taken).
 
-Requires Bitcoin Core 32.1 -- the REST endpoints electrs 0.12.1 uses for block indexing got
-their final shape in 32.x. Pass its ``bin`` directory with ``--bitcoind-dir``, or have the
-tarball unpacked at ``~/core-releases/32.1`` (the ops layout).
+Requires Bitcoin Core 32.1.0 and nothing else -- the REST endpoints electrs 0.12.1 uses for
+block indexing got their final shape in 32.x, and a 32.1.x or 32.10 build is a different
+release: the version is compared as a whole token, not as a prefix. Pass its ``bin``
+directory with ``--bitcoind-dir``, or have the tarball unpacked at ``~/core-releases/32.1``
+(the ops layout).
 
 Usage:
     python3 contrib/regtest_smoke.py [--bitcoind-dir DIR] [--workdir DIR] [--keep] [BINARY]
@@ -32,6 +36,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -41,11 +46,40 @@ import time
 
 results = []
 
+# The exact Core release this binary's REST block reads were verified on. Whole token, so
+# v32.1.7 and v32.10.0 (both of which contain "v32.1") are refused.
+BITCOIND_VERSION = "v32.1.0"
+
 
 def check(name, ok, detail=None):
     results.append((name, ok, detail))
     note = "" if detail is None else " :: " + str(detail)[:300]
     print(("PASS " if ok else "FAIL ") + name + note, flush=True)
+
+
+def alive(proc, what):
+    """Something this script started must still be running at this point.
+
+    A refusal that kills the server, or a node that died mid-run, would otherwise leave the
+    later checks passing against a different process (or failing for the wrong reason), and a
+    "refused" check would pass even if the process died while refusing.
+    """
+    rc = proc.poll()
+    check(f"{what} still running", rc is None, None if rc is None else f"exited rc={rc}")
+    return rc is None
+
+
+def refusal_message(limit):
+    """The refusal src/status.rs raises, as the client sees it (electrum.rs: RpcError::BadRequest
+    -> {"code": 1, "message": <error>}). Clients may match on it, so the checks below compare the
+    whole string rather than looking for "error"."""
+    return f"index_lookup_limit: script hash history has more than {limit} transactions; refusing to build it"
+
+
+def refused(r, limit):
+    """True only for that exact refusal: JSON-RPC error code 1 and the message above."""
+    err = r.get("error") or {}
+    return err.get("code") == 1 and err.get("message") == refusal_message(limit)
 
 
 def env_port(name, default):
@@ -146,14 +180,17 @@ def main():
         sys.exit(f"regtest_smoke: {binary} is not executable (build it, or pass a path)")
 
     bindir = find_bitcoind(args.bitcoind_dir)
-    version = subprocess.run([os.path.join(bindir, "bitcoind"), "--version"],
-                             capture_output=True, text=True).stdout.splitlines()[0]
-    if "v32.1" not in version:
-        sys.exit(f"regtest_smoke: {bindir}/bitcoind is '{version}', not Core v32.1 "
-                 f"(electrs 0.12.1's REST block reads were verified on 32.1; pass "
-                 f"--bitcoind-dir with the 32.1 bin directory)")
+    version_line = subprocess.run([os.path.join(bindir, "bitcoind"), "--version"],
+                                  capture_output=True, text=True).stdout.splitlines()[0]
+    found = re.search(r"[Vv]ersion (v[0-9][0-9.]*)", version_line)
+    version = found.group(1) if found else ""
+    if version != BITCOIND_VERSION:
+        sys.exit(f"regtest_smoke: {bindir}/bitcoind is '{version_line}' (version "
+                 f"'{version or 'none'}'), not exactly Core {BITCOIND_VERSION} "
+                 f"(electrs 0.12.1's REST block reads were verified on that release and a "
+                 f"32.1.x is a different one; pass --bitcoind-dir with the 32.1 bin directory)")
     print(f"electrs:  {binary}")
-    print(f"bitcoind: {bindir} ({version})")
+    print(f"bitcoind: {bindir} ({version_line})")
 
     work = os.path.abspath(args.workdir or tempfile.mkdtemp(prefix="electrs-regtest-smoke-"))
     data = os.path.join(work, "data")
@@ -357,23 +394,56 @@ def main():
                            for e in c.ok("blockchain.scripthash.get_history_paged",
                                          [sh, None, 1000])["entries"])
         check("paged excludes mempool (documented: confirmed only)", not mem_in_paged)
+        alive(electrs, "electrs after the paged sweep")
         c.close()
         electrs.terminate()
         electrs.wait(30)
 
-        # --- index_lookup_limit: same db, limit 5 ---
+        # --- index_lookup_limit: same db, at the boundary and below it ---
+        #
+        # A history of exactly N entries under --index-lookup-limit N is SERVED: the walk asks the
+        # index for N + 1 candidates, gets N back, and stops. One below, the same history is
+        # N = limit + 1 candidates and must be REFUSED -- with code 1 and this exact message,
+        # because a client matches on it and a bare "some error" would let a regression through.
+        electrs, c = start_electrs("--index-lookup-limit", str(N))
+        wait_synced(c, height)
+        r = c.call("blockchain.scripthash.get_history", [sh])
+        served = r.get("result") or []
+        conf_served = set((e["tx_hash"], e["height"]) for e in served if e["height"] > 0)
+        check(f"index_lookup_limit={N} serves a history of exactly {N} entries (boundary)",
+              r.get("error") is None and conf_served == truth,
+              r.get("error") or f"confirmed={len(conf_served)} unconfirmed={len(served) - len(conf_served)}")
+        alive(electrs, "electrs after serving the boundary")
+        c.close()
+        electrs.terminate()
+        electrs.wait(30)
+
+        electrs, c = start_electrs("--index-lookup-limit", str(N - 1))
+        wait_synced(c, height)
+        r = c.call("blockchain.scripthash.get_history", [sh])
+        check(f"index_lookup_limit={N - 1} refuses {N} entries (limit + 1): code 1, exact message",
+              refused(r, N - 1), r.get("error"))
+        alive(electrs, "electrs after the boundary refusal")
+        c.close()
+        electrs.terminate()
+        electrs.wait(30)
+
+        # --- limit 5: far below the history, plus what has to keep working underneath it ---
         electrs, c = start_electrs("--index-lookup-limit", "5")
         wait_synced(c, height)
         r = c.call("blockchain.scripthash.get_history", [sh])
-        check("index_lookup_limit=5 refuses get_history (N entries)", bool(r.get("error")),
-              r.get("error"))
+        check(f"index_lookup_limit=5 refuses get_history ({N} entries): code 1, exact message",
+              refused(r, 5), r.get("error"))
         c = Electrum(e_port)
         r = c.call("blockchain.scripthash.subscribe", [sh])
-        check("index_lookup_limit=5 refuses subscribe", bool(r.get("error")), r.get("error"))
+        check("index_lookup_limit=5 refuses subscribe: code 1, exact message", refused(r, 5),
+              r.get("error"))
         c = Electrum(e_port)
         check("server answers after refusal", c.ok("server.ping") is None)
+        alive(electrs, "electrs after the refusal")
         d = c.ok("blockchain.scripthash.get_history_paged", [sh, None, 100])
         check("paged ignores index_lookup_limit", len(d["entries"]) == N)
+        alive(node.proc, "bitcoind")
         small = cli("getnewaddress", wallet="miner")
         cli("sendtoaddress", small, "0.2", wallet="miner")
         cli("generatetoaddress", 1, mine)
