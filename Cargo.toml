@@ -50,3 +50,10 @@ configure_me_codegen = { version = "0.4.8", default-features = false }
 bitcoin-test-data = "0.2.0"
 hex_lit = "0.1.1"
 tempfile = "3.25"
+
+# A paged script-hash history needs a seekable, limited index scan, which bindex
+# does not expose (its scan collects every matching txnum before returning).
+# Vendored under vendor/ so a checkout of this repository builds exactly the code
+# the deployed binary runs, instead of depending on a patch applied by hand.
+[patch.crates-io]
+bindex = { path = "vendor/bindex" }
