@@ -129,6 +129,77 @@ impl From<bindex::Location<'_>> for BlockKey {
     }
 }
 
+/// Candidates read per index seek when no `index_lookup_limit` applies.
+///
+/// Large enough that an ordinary address is a single seek, small enough that a history of
+/// millions is never collected into one `Vec`.
+const HISTORY_SCAN_PAGE: usize = 4_096;
+
+/// Walk a script hash's history candidates in chronological order, one bounded seek at a
+/// time, and refuse as soon as the index holds more than `lookup_limit` of them.
+///
+/// This is the `index_lookup_limit` enforcement. It asks the index for at most `limit + 1`
+/// candidates in total and decides on the page it gets back, so a refused address costs
+/// about one page of key reads — the same as one page of
+/// `blockchain.scripthash.get_history_paged` — instead of one transaction body read per
+/// entry up to the limit. The check happens before `visit` is called for any candidate in
+/// that page, so a refusal reads no transaction at all.
+///
+/// `fetch_page(from, want)` must return at most `want` candidates, in ascending order,
+/// starting at `from` inclusive (the same seek semantics as the index). `visit` is called
+/// once per candidate, in that order.
+///
+/// Split out from `sync_confirmed` so the budget can be tested without an index.
+fn walk_candidates<F, V>(
+    lookup_limit: Option<usize>,
+    from: u32,
+    mut fetch_page: F,
+    mut visit: V,
+) -> Result<usize>
+where
+    F: FnMut(u32, usize) -> Result<Vec<u32>>,
+    V: FnMut(u32) -> Result<()>,
+{
+    let mut from = from;
+    let mut seen = 0usize;
+    loop {
+        let want = match lookup_limit {
+            // Never ask for more than `limit + 1`: the extra candidate is the proof that
+            // the history does not fit, and there is no reason to read past it.
+            Some(limit) => limit.saturating_add(1).saturating_sub(seen),
+            None => HISTORY_SCAN_PAGE,
+        };
+        if want == 0 {
+            break;
+        }
+        let page = fetch_page(from, want)?;
+        if page.is_empty() {
+            break;
+        }
+        if let Some(limit) = lookup_limit {
+            if seen + page.len() > limit {
+                anyhow::bail!(
+                    "index_lookup_limit: script hash history has more than {limit} \
+                     transactions; refusing to build it"
+                );
+            }
+        }
+        for &txnum in &page {
+            visit(txnum)?;
+            seen += 1;
+        }
+        // The index seek is inclusive, so continue past the last candidate examined.
+        match page.last().and_then(|txnum| txnum.checked_add(1)) {
+            Some(next) => from = next,
+            None => break,
+        }
+        if page.len() < want {
+            break;
+        }
+    }
+    Ok(seen)
+}
+
 /// ScriptHash subscription status
 pub struct ScriptHashStatus {
     scripthash: ScriptHash, // specific scripthash to be queried
@@ -324,49 +395,57 @@ impl ScriptHashStatus {
         }
         // Recompute all funded outpoints
         let mut outpoints = self.confirmed_outpoints();
-        // Process transactions in chronological order.
+        // Process transactions in chronological order, one bounded index seek at a time.
         //
-        // `lookup_limit` is enforced on the first entry PAST the limit, so the
-        // expensive part — reading and decoding every matching transaction, and
-        // caching its merkle proof — is never paid for an address that exceeds it.
-        // Refusing is the entire point: the alternative is materialising a
-        // multi-hundred-MB history that starves every other client on this port.
-        let mut seen = 0usize;
-        for location in index.locations_by_scripthash(&self.scripthash, latest_header)? {
-            seen += 1;
-            if let Some(limit) = lookup_limit {
-                if seen > limit {
-                    anyhow::bail!(
-                        "index_lookup_limit: script hash history has more than {limit} \
-                         transactions; refusing to build it"
-                    );
+        // `lookup_limit` is enforced by `walk_candidates` before the first transaction is
+        // read: the walk asks the index for at most `limit + 1` candidates, so an address
+        // that exceeds the limit costs about one page of key reads and nothing else — no
+        // body fetch, no decode, no merkle proof. Refusing is the entire point: the
+        // alternative is materialising a multi-hundred-MB history that starves every other
+        // client on this port.
+        let scripthash = self.scripthash;
+        let from = latest_header
+            .map(|header| header.next_txnum().to_u32())
+            .unwrap_or_default();
+        let outpoints = &mut outpoints;
+        walk_candidates(
+            lookup_limit,
+            from,
+            |from, want| {
+                Ok(index
+                    .script_hash_page(&scripthash, from, want, false)?
+                    .into_iter()
+                    .map(|entry| entry.txnum)
+                    .collect())
+            },
+            |txnum| {
+                let location = index.location_by_txnum(txnum);
+                let tx_bytes = index.get_tx_bytes(&location)?;
+                let tx = Transaction::consensus_decode_from_finite_reader(&mut &tx_bytes[..])?;
+
+                // Check if this transaction has relevant inputs/outputs:
+                let spent = filter_inputs(&tx, outpoints);
+                let outputs = filter_outputs(&tx, scripthash);
+                if spent.is_empty() && outputs.is_empty() {
+                    return Ok(());
                 }
-            }
 
-            let tx_bytes = index.get_tx_bytes(&location)?;
-            let tx = Transaction::consensus_decode_from_finite_reader(&mut &tx_bytes[..])?;
+                // Build new TxEntry and add new outpoints (for next transactions)
+                let mut tx_entry = TxEntry::new(tx.compute_txid());
+                tx_entry.spent = spent;
+                tx_entry.outputs = outputs;
+                outpoints.extend(tx_entry.funding_outpoints());
 
-            // Check if this transaction has relevant inputs/outputs:
-            let spent = filter_inputs(&tx, &outpoints);
-            let outputs = filter_outputs(&tx, self.scripthash);
-            if spent.is_empty() && outputs.is_empty() {
-                continue;
-            }
+                // Add new per-block entry (if needed)
+                self.confirmed
+                    .entry(BlockKey::from(location))
+                    .or_default()
+                    .push(tx_entry);
+                Ok(())
+            },
+        )?;
 
-            // Build new TxEntry and add new outpoints (for next transactions)
-            let mut tx_entry = TxEntry::new(tx.compute_txid());
-            tx_entry.spent = spent;
-            tx_entry.outputs = outputs;
-            outpoints.extend(tx_entry.funding_outpoints());
-
-            // Add new per-block entry (if needed)
-            self.confirmed
-                .entry(BlockKey::from(location))
-                .or_default()
-                .push(tx_entry);
-        }
-
-        Ok(outpoints)
+        Ok(outpoints.to_owned())
     }
 
     /// Get funding and spending entries from current mempool.
@@ -474,9 +553,120 @@ fn compute_status_hash(history: &[HistoryEntry]) -> Option<StatusHash> {
 
 #[cfg(test)]
 mod tests {
-    use super::HistoryEntry;
+    use super::{walk_candidates, HistoryEntry, HISTORY_SCAN_PAGE};
     use crate::bitcoin::Amount;
     use serde_json::json;
+
+    /// A stand-in for the index's script-hash scan: `total` candidates numbered `0..total`,
+    /// seeked inclusively at `from` and cut at `want`, exactly like `scan_by_script_hash_page`.
+    ///
+    /// Every call is recorded, so a test can assert how many candidates the walk asked the
+    /// index to read — that is the cost the limit is supposed to bound.
+    fn fake_scan(
+        total: u32,
+        seeks: &mut Vec<(u32, usize)>,
+    ) -> impl FnMut(u32, usize) -> anyhow::Result<Vec<u32>> + '_ {
+        move |from, want| {
+            seeks.push((from, want));
+            Ok((from..total).take(want).collect())
+        }
+    }
+
+    /// The fix: an over-limit history is refused after reading `limit + 1` candidates and
+    /// looking at no transaction at all. Before, the walk collected every candidate and
+    /// then read `limit` transaction bodies before it could refuse.
+    #[test]
+    fn test_walk_refuses_at_limit_plus_one_without_reading_a_transaction() {
+        let mut seeks = Vec::new();
+        let mut visited = Vec::new();
+        let err = walk_candidates(Some(5), 0, fake_scan(10_000, &mut seeks), |txnum| {
+            visited.push(txnum);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("script hash history has more than 5 transactions"),
+            "unexpected error: {err}"
+        );
+        // One seek, for limit + 1 candidates. The 10_000-entry history is never collected.
+        assert_eq!(seeks, vec![(0, 6)]);
+        assert!(visited.is_empty(), "refusal must not read a transaction");
+    }
+
+    /// A history of exactly `limit` entries is served, not refused (off-by-one guard), and
+    /// the walk still only asks for `limit + 1`.
+    #[test]
+    fn test_walk_serves_history_of_exactly_the_limit() {
+        let mut seeks = Vec::new();
+        let mut visited = Vec::new();
+        let seen = walk_candidates(Some(5), 0, fake_scan(5, &mut seeks), |txnum| {
+            visited.push(txnum);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(seen, 5);
+        assert_eq!(visited, vec![0, 1, 2, 3, 4]);
+        assert_eq!(seeks, vec![(0, 6)]);
+    }
+
+    /// A limit of zero is the strictest setting, not "unlimited" (`Some(0)`, not `None`):
+    /// the first candidate is enough to refuse, and an empty history is still fine.
+    #[test]
+    fn test_walk_limit_zero() {
+        let mut seeks = Vec::new();
+        let err = walk_candidates(Some(0), 0, fake_scan(3, &mut seeks), |_| Ok(())).unwrap_err();
+        assert!(err.to_string().contains("more than 0 transactions"));
+        assert_eq!(seeks, vec![(0, 1)]);
+
+        let mut seeks = Vec::new();
+        assert_eq!(
+            walk_candidates(Some(0), 0, fake_scan(0, &mut seeks), |_| Ok(())).unwrap(),
+            0
+        );
+    }
+
+    /// Without a limit the walk still pages (a huge history is never one `Vec`) and visits
+    /// every candidate exactly once, in order.
+    #[test]
+    fn test_walk_without_limit_pages_through_everything() {
+        let total = 10_000u32;
+        let mut seeks = Vec::new();
+        let mut visited = Vec::new();
+        let seen = walk_candidates(None, 0, fake_scan(total, &mut seeks), |txnum| {
+            visited.push(txnum);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(seen, total as usize);
+        assert_eq!(visited, (0..total).collect::<Vec<_>>());
+        assert!(
+            seeks.iter().all(|&(_, want)| want == HISTORY_SCAN_PAGE),
+            "unbounded walk must stay in pages: {seeks:?}"
+        );
+        assert!(seeks.len() > 1, "10k candidates must not be one seek");
+        assert_eq!(seeks[0], (0, HISTORY_SCAN_PAGE));
+    }
+
+    /// An incremental sync starts where the last indexed block ended, and a reorg-resumed
+    /// walk must not revisit what it already has.
+    #[test]
+    fn test_walk_starts_at_from() {
+        let mut seeks = Vec::new();
+        let mut visited = Vec::new();
+        walk_candidates(None, 9_000, fake_scan(10_000, &mut seeks), |txnum| {
+            visited.push(txnum);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(visited.first(), Some(&9_000));
+        assert_eq!(visited.len(), 1_000);
+        assert_eq!(seeks, vec![(9_000, HISTORY_SCAN_PAGE)]);
+    }
 
     #[test]
     fn test_txinfo_json() {
