@@ -445,7 +445,10 @@ impl ScriptHashStatus {
             },
         )?;
 
-        Ok(outpoints.to_owned())
+        // `outpoints` is borrowed mutably for the walk, so it is moved out instead of cloned:
+        // the caller wants the set itself, and copying it once more is exactly the kind of cost
+        // the walk exists to bound.
+        Ok(std::mem::take(outpoints))
     }
 
     /// Get funding and spending entries from current mempool.
