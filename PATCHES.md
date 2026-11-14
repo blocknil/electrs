@@ -54,7 +54,7 @@ requests. The walk now stops at the limit instead. On regtest, with one address 
 |---|---|---|
 | 200 | 13.9 ms (12.8-23.3 ms, n=5) | 0.9 ms |
 | 2000 | 120 ms (117-122 ms, n=5) | 1.0 ms |
-| `server.ping` during a refusal, limit 2000 | up to 32.8 ms | 1.5 ms |
+| `server.ping` during a refusal | up to 32.8 ms (limit 2000) | at most 1.5 ms (limit 200) |
 
 The after column is flat in `limit`, which is the point: the cost is one page of index
 reads, not one transaction body per entry. Five unit tests in `src/status.rs` pin the
