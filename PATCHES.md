@@ -20,7 +20,7 @@ transactions to lookup before server to get stuck", so setting it looks like pro
 that is not there.
 
 Without it, `blockchain.scripthash.get_history` on a large address walks the entire
-history. Measured on an exchange address in production:
+history. Measured in production on a large address:
 
     index reads    859 MB
     RSS           1.05 GB
@@ -32,14 +32,37 @@ The process never crashes — it stops answering, which is why this presents as 
 addresses fail" rather than as a server that died.
 
 **Change** (`src/tracker.rs`, `src/status.rs`): the value is threaded into the history
-walk, and the walk refuses on the first entry past the limit, *before* reading or
-decoding that entry. The refusal is a normal JSON-RPC error, so a client can tell it
-apart from a timeout.
+walk, and the walk decides on the index's *candidates* before it reads a single
+transaction. It asks the index for at most `limit + 1` of them in one seek (`bindex`'s
+`script_hash_page`, oldest first) and refuses if it gets more than `limit` back, so a
+refused address costs about one page of index reads and no block reads at all. The
+refusal is a normal JSON-RPC error, so a client can tell it apart from a timeout.
 
 | | before | after |
 |---|---|---|
-| over-limit address | never returns; everyone starved | refused in ~1.5-3.8 s |
-| other clients during it | starved for minutes | a concurrent ping waits ~4 s, then normal |
+| over-limit address | never returns; everyone starved | refused in ~1 ms on regtest, flat in `limit` |
+| other clients during it | starved for minutes | no measurable wait |
+
+The first version of this patch (0.12.0 line) counted entries *while walking them*: it
+refused on the first entry past the limit, but only after reading and decoding `limit`
+transaction bodies, so a refusal still cost 1.5-3.8 s in production and held up other
+requests. The walk now stops at the limit instead. On regtest, with one address holding
+5,000 confirmed entries and both binaries built from this tree on the same machine
+(Bitcoin Core 32.1, local REST, `release`):
+
+| `index_lookup_limit` | before (0.12.0 walk) | after |
+|---|---|---|
+| 200 | 13.9 ms (12.8-23.3 ms, n=5) | 0.9 ms |
+| 2000 | 120 ms (117-122 ms, n=5) | 1.0 ms |
+| `server.ping` during a refusal, limit 2000 | up to 32.8 ms | 1.5 ms |
+
+The after column is flat in `limit`, which is the point: the cost is one page of index
+reads, not one transaction body per entry. Five unit tests in `src/status.rs` pin the
+budget (refusal at `limit + 1` with zero transactions read, a history of exactly the
+limit, a limit of zero, paging without a limit, resuming from a txnum), and
+`contrib/regtest_smoke.py` checks the same behaviour end to end against bitcoind
+(`index_lookup_limit=5 refuses get_history`, `server answers after refusal`,
+`index_lookup_limit=5 serves a small address`).
 
 ## 2. History had no pagination
 
@@ -95,8 +118,8 @@ know this method and cannot be broken by it.
 
 `scan_by_script_hash_page` is the same seek as the existing
 `scan_by_script_hash`, with a direction and a `limit` that stops the RocksDB iterator
-early. It also removes the residual cost of change 1: a refusal now stops after
-`limit + 1` candidates instead of collecting millions of `TxNum`s first.
+early. Change 1's walk uses it, so a refusal stops after `limit + 1` candidates instead
+of collecting millions of `TxNum`s first.
 
 ## Building
 
@@ -114,3 +137,13 @@ than passed inline, because cc-rs reads it per spawned compiler.
 
 `Cargo.lock` is committed and kept in sync with the `[patch.crates-io]` entry, so
 `--locked` builds work.
+
+## Testing
+
+    python3 contrib/regtest_smoke.py target/release/electrs
+
+starts a throwaway Bitcoin Core 32.1 regtest node and that binary, and calls every Electrum
+method our clients use, `blockchain.scripthash.get_history_paged` in every shape, and the
+`index_lookup_limit` refusal. Its expectations come from bitcoind (`getblock ... 3`), not from
+electrs, so the two cannot agree on something wrong. Pass `--bitcoind-dir` if Core 32.1 is not
+at `~/core-releases/32.1`.
