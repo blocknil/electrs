@@ -151,16 +151,18 @@ at `~/core-releases/32.1`.
 ## Silent Payments block index
 
 `IndexedChain::open_with_silent_payments` is the opt-in storage entry point.
-Use a separate database directory. A legacy directory lacks historical rows
-and is rejected before opening it for writes. Set
+Use a separate database directory. The paged index uses the
+`silent_payments_v3` column family. Databases built without Silent Payments
+or with the earlier experimental format require a fresh index directory. Set
 `--index-silent-payments` to enable it on a scratch or staging index.
 
-The index uses the block and spent outputs already fetched from Core. Each
-record is keyed by height and block hash. The record includes all eligible
-transactions and their Taproot outputs, including spent outputs and small
-amounts. An empty record represents a fully indexed block with no tweaks.
-RocksDB writes and deletes the record with the regular block records. On
-rollback, the stored block identity determines which tweak record to delete.
+The index uses the block and spent outputs already fetched from Core. A
+block's metadata and 32-row shards share its height and hash as their key
+prefix. Rows include all eligible transactions and their Taproot outputs,
+including spent outputs and small amounts. A zero row count distinguishes
+an indexed empty block. RocksDB writes metadata, shards and canonical
+block records in one batch. Rollback deletes the metadata and shard range
+for the old block in the same batch as its canonical records.
 
 Run the vendored bindex suite against our pinned Bitcoin Core 32.1 release
 using `BITCOIND_EXE=/absolute/path/to/bitcoind cargo test --locked
@@ -189,8 +191,13 @@ A changed anchor returns -32021. A saturated or expired queue returns
 retryable -32020. Restart at a fresh anchor on a chain change.
 
 The handler checks the anchor and block records from one RocksDB snapshot.
-There are two scan workers and eight queue slots. Each request covers one
-block page, up to 256 entries and 4 MiB on the wire. A requested range can
+Each request reads at most nine shards to serve up to 256 entries and 4 MiB
+on the wire, including at an unaligned offset. There are two scan workers
+and eight queue slots. With the endpoint enabled, up to 16 first requests
+are classified concurrently under a three-second deadline. The established
+connection budgets are 16 scan sessions and 256 ordinary Electrum sessions.
+These are pilot limits. Check reconnect traffic and wallet sync latency
+under representative load before rollout. A requested range can
 cover at most 128 blocks. Responses and writes run outside the normal
 Electrum event loop. When serving Electrum, the enabled index syncs in
 32-block batches. Offline builds with `--disable-electrum-rpc` use
@@ -257,6 +264,14 @@ all connections. Operators can change the experimental ceiling with
 before reading its next request. The existing queue and response size limits
 still apply. The candidate also returns a readiness error for header
 subscriptions before genesis is indexed.
+
+The sharded candidate passed 20 electrs tests, 9 vendored bindex tests
+and the Core 32.1 smoke suite with scanning enabled (71 checks) and
+disabled (61 checks). A local replay of the 1,661-block fixture on
+2026-11-25 used 120 sync samples per mode and targeted 105 scan pages
+per second. The two less contended trials served about 88 pages per
+second. Staging still needs a representative sync latency run and an
+index backfill and disk-size measurement.
 
 Build `core/examples/electrum_scan_probe.rs` from wallet source and pass its
 binary to the local driver. It uses fresh regtest wallets and the production

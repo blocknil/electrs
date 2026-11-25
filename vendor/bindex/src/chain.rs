@@ -33,7 +33,7 @@ pub enum Error {
     #[error("block not found: {0}")]
     BlockNotFound(#[from] headers::Reorg),
 
-    #[error("Silent Payments requires a fresh or already enabled bindex database")]
+    #[error("Silent Payments requires a fresh or current-format bindex database")]
     SilentPaymentsFormat,
 
     #[error("missing Silent Payments index for block={0} at height={1}")]
@@ -301,18 +301,26 @@ impl IndexedChain {
         self.silent_payments_start
     }
 
-    /// Read a complete record for a canonical block, including an explicitly empty one.
-    pub fn silent_payment_block(
+    #[cfg(test)]
+    fn silent_payment_block(
         &self,
         height: u32,
         hash: BlockHash,
     ) -> Result<Vec<crate::SilentPaymentEntry>, Error> {
         self.headers.get_header(hash, height as usize)?;
-        let row = self
-            .store
-            .silent_payment_block(height, hash)?
+        let reader = self
+            .silent_payments_reader()
             .ok_or(Error::SilentPaymentsMissing(hash, height))?;
-        Ok(index::silent_payments::decode(&row)?)
+        let mut rows = Vec::new();
+        loop {
+            let (_, count, chunk) = reader
+                .anchored_page(height, height, hash, rows.len())
+                .map_err(|_| Error::SilentPaymentsMissing(hash, height))?;
+            rows.extend(chunk);
+            if rows.len() == count {
+                return Ok(rows);
+            }
+        }
     }
 
     fn fetch_new_headers(&mut self, limit: usize) -> Result<HeaderChunk, Error> {
@@ -758,11 +766,7 @@ mod tests {
         assert_ne!(old, replacement);
         assert_eq!(chain.sync(1000).unwrap().tip, replacement);
         assert!(chain.silent_payment_block(height, old).is_err());
-        assert!(chain
-            .store
-            .silent_payment_block(height, old)
-            .unwrap()
-            .is_none());
+        assert!(!chain.store.has_silent_payment_keys(height, old).unwrap());
         assert!(chain
             .silent_payment_block(height, replacement)
             .unwrap()
@@ -781,11 +785,7 @@ mod tests {
             .silent_payment_block(height, replacement)
             .unwrap()
             .is_empty());
-        assert!(chain
-            .store
-            .silent_payment_block(height, old)
-            .unwrap()
-            .is_none());
+        assert!(!chain.store.has_silent_payment_keys(height, old).unwrap());
 
         let legacy_dir = tempfile::TempDir::new().unwrap();
         let legacy = IndexedChain::open(legacy_dir.path(), Network::Regtest, url()).unwrap();

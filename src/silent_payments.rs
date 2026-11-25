@@ -19,7 +19,7 @@ use crate::{
 
 const METHOD: &str = "blockchain.silent_payments.get";
 const MAX_REQUEST: usize = 4096;
-const MAX_PAGE_ROWS: usize = 256;
+
 const MAX_RANGE: u32 = 128;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
@@ -41,6 +41,9 @@ pub(crate) fn features(start: u32, tip: Option<usize>) -> Value {
 // Use a separate connection on the same port so regular RPCs and scan writes never share
 // a socket or the peer event loop. A dedicated connection may fetch multiple pages.
 pub(crate) fn is_scan(line: &str) -> bool {
+    if line.len() > MAX_REQUEST {
+        return line.contains(METHOD);
+    }
     if !line.contains(METHOD) && !line.contains('\\') {
         return false;
     }
@@ -125,14 +128,20 @@ fn parse_request(line: &str) -> Result<Request, Value> {
 }
 
 fn page(reader: &SilentPaymentsReader, params: Params) -> Result<Value, Failure> {
-    let (hash, rows) = reader
-        .anchored_block(params.height, params.end_height, params.end_hash)
+    let (hash, count, rows) = reader
+        .anchored_page(
+            params.height,
+            params.end_height,
+            params.end_hash,
+            params.offset,
+        )
         .map_err(|err| match err {
             SilentPaymentsReadError::StaleAnchor => Failure::Stale,
             SilentPaymentsReadError::Unavailable => Failure::Unavailable,
+            SilentPaymentsReadError::InvalidOffset => Failure::Invalid,
             _ => Failure::Internal,
         })?;
-    build_page(params, hash, &rows)
+    build_page(params, hash, count, &rows)
 }
 
 fn row_wire_size_bound(output_count: usize) -> usize {
@@ -145,16 +154,13 @@ fn row_wire_size_bound(output_count: usize) -> usize {
 fn build_page(
     params: Params,
     hash: BlockHash,
+    count: usize,
     rows: &[bindex::SilentPaymentEntry],
 ) -> Result<Value, Failure> {
-    if params.offset > rows.len() || (params.offset != 0 && params.offset == rows.len()) {
-        return Err(Failure::Invalid);
-    }
-
     let mut entries = Vec::new();
     // Leave space for fixed-size metadata, commas and the capped request ID.
     let mut remaining = MAX_RESPONSE - MAX_REQUEST;
-    for row in rows.iter().skip(params.offset).take(MAX_PAGE_ROWS) {
+    for row in rows {
         let size = row_wire_size_bound(row.outputs.len());
         if size > remaining {
             if entries.is_empty() {
@@ -174,7 +180,7 @@ fn build_page(
     }
 
     let next_offset = params.offset + entries.len();
-    let next = if next_offset < rows.len() {
+    let next = if next_offset < count {
         Some((params.height, next_offset))
     } else if params.height < params.end_height {
         Some((params.height + 1, 0))
@@ -261,10 +267,9 @@ impl ScanPool {
     pub(crate) fn run(
         &self,
         stream: &TcpStream,
-        mut reader: impl BufRead,
+        mut reader: io::BufReader<DeadlineRead<'_>>,
         mut line: String,
     ) -> io::Result<()> {
-        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         loop {
             match parse_request(&line) {
                 Ok(request) => {
@@ -302,10 +307,45 @@ impl ScanPool {
                 Err(reply) => write_reply(stream, reply)?,
             }
             line.clear();
+            reader
+                .get_mut()
+                .set_deadline(Some(Instant::now() + Duration::from_secs(30)))?;
             if !read_line(&mut reader, &mut line, MAX_REQUEST)? {
                 return Ok(());
             }
         }
+    }
+}
+
+pub(crate) struct DeadlineRead<'a> {
+    stream: &'a TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl<'a> DeadlineRead<'a> {
+    pub(crate) fn new(stream: &'a TcpStream, deadline: Option<Instant>) -> Self {
+        Self { stream, deadline }
+    }
+
+    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.deadline = deadline;
+        if deadline.is_none() {
+            self.stream.set_read_timeout(None)?;
+        }
+        Ok(())
+    }
+}
+
+impl Read for DeadlineRead<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_read_timeout(Some(remaining))?;
+        }
+        self.stream.read(bytes)
     }
 }
 
@@ -352,6 +392,18 @@ fn write_reply(mut stream: &TcpStream, response: Value) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::bitcoin::{hashes::Hash, Txid};
+    use bindex::SP_PAGE_ROWS;
+
+    #[test]
+    fn expired_read_deadline_returns_before_touching_the_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = DeadlineRead::new(&stream, Some(Instant::now()));
+        assert_eq!(
+            reader.read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     #[test]
     fn admission_does_not_accumulate_a_burst_when_idle() {
@@ -378,7 +430,7 @@ mod tests {
             end_hash: hash,
             offset,
         };
-        let rows: Vec<_> = (0..=MAX_PAGE_ROWS)
+        let rows: Vec<_> = (0..=SP_PAGE_ROWS)
             .map(|i| {
                 let mut txid = [0; 32];
                 txid[..8].copy_from_slice(&(i as u64).to_le_bytes());
@@ -393,14 +445,17 @@ mod tests {
                 }
             })
             .collect();
-        let first = build_page(params(0), hash, &rows).unwrap();
-        assert_eq!(first["entries"].as_array().unwrap().len(), MAX_PAGE_ROWS);
-        assert_eq!(first["next"], json!([100, MAX_PAGE_ROWS]));
-        let second = build_page(params(MAX_PAGE_ROWS), hash, &rows).unwrap();
-        assert_eq!(
-            second["entries"][0]["txid"],
-            json!(rows[MAX_PAGE_ROWS].txid)
-        );
+        let first = build_page(params(0), hash, rows.len(), &rows[..SP_PAGE_ROWS]).unwrap();
+        assert_eq!(first["entries"].as_array().unwrap().len(), SP_PAGE_ROWS);
+        assert_eq!(first["next"], json!([100, SP_PAGE_ROWS]));
+        let second = build_page(
+            params(SP_PAGE_ROWS),
+            hash,
+            rows.len(),
+            &rows[SP_PAGE_ROWS..],
+        )
+        .unwrap();
+        assert_eq!(second["entries"][0]["txid"], json!(rows[SP_PAGE_ROWS].txid));
         assert_eq!(second["next"], json!([101, 0]));
     }
 
@@ -430,7 +485,7 @@ mod tests {
             offset: 0,
         };
         let bound = row_wire_size_bound(row.outputs.len());
-        let page = build_page(params, hash, &[row]).unwrap();
+        let page = build_page(params, hash, 1, &[row]).unwrap();
         assert!(page["entries"][0].to_string().len() < bound);
     }
 

@@ -27,7 +27,10 @@ pub struct SilentPaymentEntry {
     pub outputs: Vec<SilentPaymentOutput>,
 }
 
-pub(super) fn index(block: &BlockBytes, spent: &SpentBytes) -> Result<Vec<u8>, Error> {
+pub(super) fn index(
+    block: &BlockBytes,
+    spent: &SpentBytes,
+) -> Result<Vec<SilentPaymentEntry>, Error> {
     let block: Block = deserialize(&block.0)?;
     let mut prevouts = Cursor::new(spent.0.as_slice());
     if VarInt::consensus_decode_from_finite_reader(&mut prevouts)?.0 != block.txdata.len() as u64 {
@@ -50,7 +53,7 @@ pub(super) fn index(block: &BlockBytes, spent: &SpentBytes) -> Result<Vec<u8>, E
     if prevouts.position() != spent.0.len() as u64 {
         return Err(Error::SpentAlignment);
     }
-    Ok(encode(&entries))
+    Ok(entries)
 }
 
 fn transaction_entry(
@@ -161,7 +164,7 @@ fn input_key(input: &TxIn, script: &Script) -> Option<PublicKey> {
     None
 }
 
-fn encode(entries: &[SilentPaymentEntry]) -> Vec<u8> {
+pub(crate) fn encode(entries: &[SilentPaymentEntry]) -> Vec<u8> {
     let mut bytes = Vec::new();
     VarInt(entries.len() as u64)
         .consensus_encode(&mut bytes)

@@ -7,6 +7,11 @@ use std::{
     io::{BufRead, BufReader, Write},
     iter::once,
     net::{Shutdown, TcpListener, TcpStream},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -14,7 +19,7 @@ use crate::{
     electrum::{Client, Rpc},
     metrics::{self, Metrics},
     signals::ExitError,
-    silent_payments::{self, ScanPool},
+    silent_payments::{self, DeadlineRead, ScanPool},
     thread::spawn,
 };
 
@@ -22,12 +27,18 @@ struct Peer {
     id: usize,
     client: Client,
     stream: TcpStream,
+    _permit: Option<Arc<ConnectionPermit>>,
 }
 
 impl Peer {
-    fn new(id: usize, stream: TcpStream) -> Self {
+    fn new(id: usize, stream: TcpStream, permit: Option<Arc<ConnectionPermit>>) -> Self {
         let client = Client::default();
-        Self { id, client, stream }
+        Self {
+            id,
+            client,
+            stream,
+            _permit: permit,
+        }
     }
 
     fn send(&mut self, values: Vec<String>) -> Result<()> {
@@ -154,7 +165,7 @@ struct Event {
 }
 
 enum Message {
-    New(TcpStream),
+    New(TcpStream, Option<Arc<ConnectionPermit>>),
     Request(String),
     Done,
 }
@@ -179,9 +190,9 @@ fn handle_peer_events(
     let mut done = false;
     for msg in messages {
         match msg {
-            Message::New(stream) => {
+            Message::New(stream, permit) => {
                 debug!("{}: connected", peer_id);
-                peers.insert(peer_id, Peer::new(peer_id, stream));
+                peers.insert(peer_id, Peer::new(peer_id, stream, permit));
             }
             Message::Request(line) => lines.push(line),
             Message::Done => {
@@ -205,17 +216,66 @@ fn handle_peer_events(
     }
 }
 
+// Classification has its own short-lived budget. Scan connections cannot occupy
+// an established Electrum peer slot, including while waiting on the scan worker pool.
+const MAX_CLASSIFYING: usize = 16;
+const MAX_ORDINARY: usize = 256;
+const MAX_SCAN_CONNECTIONS: usize = 16;
+const FIRST_LINE_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Default)]
+struct ConnectionLimits {
+    classifying: Arc<AtomicUsize>,
+    ordinary: Arc<AtomicUsize>,
+    scan: Arc<AtomicUsize>,
+}
+
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+impl ConnectionPermit {
+    fn acquire(count: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        // Keep the Rust 1.85 API until the crate's minimum version supports try_update.
+        #[allow(deprecated)]
+        count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < limit).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(count)))
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn accept_loop(
     listener: TcpListener,
     server_tx: Sender<Event>,
     scans: Option<ScanPool>,
 ) -> Result<()> {
+    let limits = ConnectionLimits::default();
     for (peer_id, conn) in listener.incoming().enumerate() {
         let stream = conn.context("failed to accept")?;
         let tx = server_tx.clone();
-        let scans = scans.clone();
+        let admission = if let Some(scans) = scans.clone() {
+            let Some(permit) = ConnectionPermit::acquire(&limits.classifying, MAX_CLASSIFYING)
+            else {
+                continue;
+            };
+            Some((
+                scans,
+                limits.clone(),
+                permit,
+                Instant::now() + FIRST_LINE_TIMEOUT,
+            ))
+        } else {
+            None
+        };
         spawn("recv_loop", move || {
-            let result = recv_loop(peer_id, &stream, tx, scans.as_ref());
+            let result = recv_loop(peer_id, &stream, tx, admission);
             if let Err(e) = stream.shutdown(Shutdown::Read) {
                 warn!("{}: failed to shutdown TCP receiving {}", peer_id, e)
             }
@@ -229,25 +289,40 @@ fn recv_loop(
     peer_id: usize,
     stream: &TcpStream,
     server_tx: Sender<Event>,
-    scans: Option<&ScanPool>,
+    admission: Option<(ScanPool, ConnectionLimits, ConnectionPermit, Instant)>,
 ) -> Result<()> {
-    let mut reader = BufReader::new(stream);
-    let first = if let Some(scans) = scans {
+    let mut reader = BufReader::new(DeadlineRead::new(
+        stream,
+        admission.as_ref().map(|entry| entry.3),
+    ));
+    let ordinary_permit;
+    let first = if let Some((scans, limits, classifying, _)) = admission {
         let mut line = String::new();
         if !silent_payments::read_line(&mut reader, &mut line, 8 * 1024 * 1024)? {
             return Ok(());
         }
         if silent_payments::is_scan(&line) {
+            let Some(_scan) = ConnectionPermit::acquire(&limits.scan, MAX_SCAN_CONNECTIONS) else {
+                return Ok(());
+            };
+            drop(classifying);
             let result = scans.run(stream, reader, line);
             let _ = stream.shutdown(Shutdown::Both);
             return result.context("Silent Payments connection failed");
         }
+        let Some(permit) = ConnectionPermit::acquire(&limits.ordinary, MAX_ORDINARY) else {
+            return Ok(());
+        };
+        ordinary_permit = Some(Arc::new(permit));
+        drop(classifying);
+        reader.get_mut().set_deadline(None)?;
         Some(Ok(line))
     } else {
+        ordinary_permit = None;
         None
     };
 
-    let msg = Message::New(stream.try_clone()?);
+    let msg = Message::New(stream.try_clone()?, ordinary_permit.clone());
     server_tx.send(Event { peer_id, msg })?;
     for (index, line) in first.into_iter().chain(reader.lines()).enumerate() {
         if let Err(e) = &line {
@@ -274,4 +349,21 @@ fn recv_loop(
     let msg = Message::Done;
     server_tx.send(Event { peer_id, msg })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_admission_leaves_ordinary_slots_available_and_releases_on_drop() {
+        let limits = ConnectionLimits::default();
+        let scans: Vec<_> = (0..MAX_SCAN_CONNECTIONS)
+            .map(|_| ConnectionPermit::acquire(&limits.scan, MAX_SCAN_CONNECTIONS).unwrap())
+            .collect();
+        assert!(ConnectionPermit::acquire(&limits.scan, MAX_SCAN_CONNECTIONS).is_none());
+        assert!(ConnectionPermit::acquire(&limits.ordinary, MAX_ORDINARY).is_some());
+        drop(scans);
+        assert!(ConnectionPermit::acquire(&limits.scan, MAX_SCAN_CONNECTIONS).is_some());
+    }
 }

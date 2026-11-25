@@ -213,7 +213,7 @@ pub struct Batch {
     pub txid_rows: Vec<HashPrefixRow>,
     pub txpos_rows: Vec<txpos::TxBlockPosRow>,
     pub header: IndexedHeader,
-    pub(crate) silent_payments: Option<(u32, Vec<u8>)>,
+    pub(crate) silent_payments: Option<(u32, Vec<crate::SilentPaymentEntry>)>,
 }
 
 impl Batch {

@@ -11,7 +11,7 @@ mod headers;
 mod index;
 
 pub use chain::{IndexedChain, ScriptHashPageEntry};
-pub use db::{SilentPaymentsReadError, SilentPaymentsReader};
+pub use db::{SilentPaymentsReadError, SilentPaymentsReader, SP_PAGE_ROWS};
 pub use headers::Headers;
 pub use index::silent_payments::{SilentPaymentEntry, SilentPaymentOutput};
 pub use index::ScriptHash;

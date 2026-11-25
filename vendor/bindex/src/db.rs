@@ -37,7 +37,9 @@ const CONFIG_CF: &str = "config";
 const CONFIG_KEY: &[u8] = b"C";
 
 const HEADERS_CF: &str = "headers";
-const SILENT_PAYMENTS_CF: &str = "silent_payments_v2";
+const SILENT_PAYMENTS_CF: &str = "silent_payments_v3";
+const SP_SHARD_ROWS: usize = 32;
+pub const SP_PAGE_ROWS: usize = 256;
 const SCRIPT_HASH_CF: &str = "script_hash";
 const TXPOS_CF: &str = "txpos";
 const TXID_CF: &str = "txid";
@@ -125,7 +127,12 @@ impl DB {
             .unwrap_or_else(|| panic!("missing CF: {name}"))
     }
 
-    fn apply_batch<F>(&self, f: F, batches: &[index::Batch]) -> Result<(), rocksdb::Error>
+    fn apply_batch<F>(
+        &self,
+        f: F,
+        batches: &[index::Batch],
+        delete: bool,
+    ) -> Result<(), rocksdb::Error>
     where
         F: Fn(&mut rocksdb::WriteBatch, &rocksdb::ColumnFamily, &[u8], &[u8]),
     {
@@ -176,8 +183,26 @@ impl DB {
             let cf = self.cf(SILENT_PAYMENTS_CF);
             for batch in batches {
                 if let Some((height, entries)) = &batch.silent_payments {
-                    let key = silent_payments_key(*height, batch.header.hash());
-                    f(&mut write_batch, cf, &key, entries);
+                    let hash = batch.header.hash();
+                    let key = silent_payments_key(*height, hash);
+                    if delete {
+                        // All shard keys sort immediately after the metadata key.
+                        write_batch.delete_range_cf(
+                            cf,
+                            key.as_slice(),
+                            shard_key(*height, hash, u32::MAX).as_slice(),
+                        );
+                        write_batch.delete_cf(cf, key);
+                    } else {
+                        write_batch.put_cf(cf, key, (entries.len() as u32).to_le_bytes());
+                        for (shard, rows) in entries.chunks(SP_SHARD_ROWS).enumerate() {
+                            write_batch.put_cf(
+                                cf,
+                                shard_key(*height, hash, shard as u32),
+                                index::silent_payments::encode(rows),
+                            );
+                        }
+                    }
                     f(
                         &mut write_batch,
                         cf,
@@ -194,18 +219,19 @@ impl DB {
         Ok(())
     }
 
-    pub fn silent_payment_block(
+    #[cfg(test)]
+    pub fn has_silent_payment_keys(
         &self,
         height: u32,
         hash: bitcoin::BlockHash,
-    ) -> Result<Option<Vec<u8>>, rocksdb::Error> {
-        if !self.silent_payments {
-            return Ok(None);
-        }
-        self.db.get_cf(
-            self.cf(SILENT_PAYMENTS_CF),
-            silent_payments_key(height, hash),
-        )
+    ) -> Result<bool, rocksdb::Error> {
+        let prefix = silent_payments_key(height, hash);
+        let mode = rocksdb::IteratorMode::From(&prefix, rocksdb::Direction::Forward);
+        let mut rows = self.db.iterator_cf(self.cf(SILENT_PAYMENTS_CF), mode);
+        Ok(rows
+            .next()
+            .transpose()?
+            .is_some_and(|(key, _)| key.starts_with(&prefix)))
     }
 
     pub fn silent_payments_reader(&self) -> Option<SilentPaymentsReader> {
@@ -214,12 +240,12 @@ impl DB {
     }
 
     pub fn write(&self, batches: &[index::Batch]) -> Result<(), rocksdb::Error> {
-        self.apply_batch(|wb, cf, k, v| wb.put_cf(cf, k, v), batches)
+        self.apply_batch(|wb, cf, k, v| wb.put_cf(cf, k, v), batches, false)
     }
 
     pub fn delete(&self, batches: &[index::Batch]) -> Result<(), rocksdb::Error> {
         // All keys contains txnum, so they are safe to delete in case of a reorg.
-        self.apply_batch(|wb, cf, k, _v| wb.delete_cf(cf, k), batches)
+        self.apply_batch(|wb, cf, k, _v| wb.delete_cf(cf, k), batches, true)
     }
 
     pub fn flush(&self) -> Result<(), rocksdb::Error> {
@@ -373,6 +399,13 @@ fn silent_payments_key(height: u32, hash: bitcoin::BlockHash) -> [u8; 36] {
     key
 }
 
+fn shard_key(height: u32, hash: bitcoin::BlockHash, shard: u32) -> [u8; 40] {
+    let mut key = [0; 40];
+    key[..36].copy_from_slice(&silent_payments_key(height, hash));
+    key[36..].copy_from_slice(&shard.to_be_bytes());
+    key
+}
+
 fn canonical_key(height: u32) -> [u8; 4] {
     height.to_be_bytes()
 }
@@ -386,6 +419,8 @@ pub enum SilentPaymentsReadError {
     StaleAnchor,
     #[error("silent payments block data is not available")]
     Unavailable,
+    #[error("invalid Silent Payments offset")]
+    InvalidOffset,
     #[error("invalid Silent Payments record")]
     Corrupt,
     #[error(transparent)]
@@ -395,13 +430,15 @@ pub enum SilentPaymentsReadError {
 }
 
 impl SilentPaymentsReader {
-    /// Read the anchor, block identity and rows from the same RocksDB view.
-    pub fn anchored_block(
+    /// Read the anchor, block identity and at most one page of rows from the same RocksDB view.
+    pub fn anchored_page(
         &self,
         height: u32,
         end_height: u32,
         end_hash: bitcoin::BlockHash,
-    ) -> Result<(bitcoin::BlockHash, Vec<crate::SilentPaymentEntry>), SilentPaymentsReadError> {
+        offset: usize,
+    ) -> Result<(bitcoin::BlockHash, usize, Vec<crate::SilentPaymentEntry>), SilentPaymentsReadError>
+    {
         if height > end_height {
             return Err(SilentPaymentsReadError::Unavailable);
         }
@@ -421,9 +458,97 @@ impl SilentPaymentsReader {
             return Err(SilentPaymentsReadError::StaleAnchor);
         }
         let hash = block_hash(height)?;
-        let row = snapshot
+        let count = snapshot
             .get_cf(cf, silent_payments_key(height, hash))?
             .ok_or(SilentPaymentsReadError::Unavailable)?;
-        Ok((hash, index::silent_payments::decode(&row)?))
+        let count = u32::from_le_bytes(
+            count
+                .as_slice()
+                .try_into()
+                .map_err(|_| SilentPaymentsReadError::Corrupt)?,
+        ) as usize;
+        if offset >= count && offset != 0 {
+            return Err(SilentPaymentsReadError::InvalidOffset);
+        }
+        let end = count.min(offset.saturating_add(SP_PAGE_ROWS));
+        let mut rows = Vec::with_capacity(end - offset);
+        for shard in offset / SP_SHARD_ROWS..end.div_ceil(SP_SHARD_ROWS) {
+            let raw = snapshot
+                .get_cf(cf, shard_key(height, hash, shard as u32))?
+                .ok_or(SilentPaymentsReadError::Corrupt)?;
+            let decoded = index::silent_payments::decode(&raw)?;
+            let start = shard * SP_SHARD_ROWS;
+            if decoded.len() != (count - start).min(SP_SHARD_ROWS) {
+                return Err(SilentPaymentsReadError::Corrupt);
+            }
+            rows.extend(
+                decoded
+                    .into_iter()
+                    .skip(offset.saturating_sub(start))
+                    .take(end - offset - rows.len()),
+            );
+        }
+        Ok((hash, count, rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchored_page_reads_only_its_shards_at_an_unaligned_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(dir.path(), true).unwrap();
+        let cf = db.cf(SILENT_PAYMENTS_CF);
+        let height = 100;
+        let hash = bitcoin::BlockHash::from_byte_array([3; 32]);
+        let count = 330u32;
+        db.db
+            .put_cf(cf, canonical_key(height), hash.as_byte_array())
+            .unwrap();
+        db.db
+            .put_cf(cf, silent_payments_key(height, hash), count.to_le_bytes())
+            .unwrap();
+        for shard in 1..=9 {
+            let start = shard * SP_SHARD_ROWS;
+            let rows: Vec<_> = (start..start + SP_SHARD_ROWS)
+                .map(|position| {
+                    let mut id = [0; 32];
+                    id[..4].copy_from_slice(&(position as u32).to_le_bytes());
+                    crate::SilentPaymentEntry {
+                        txid: bitcoin::Txid::from_byte_array(id),
+                        tweak: [2; 33],
+                        outputs: Vec::new(),
+                    }
+                })
+                .collect();
+            db.db
+                .put_cf(
+                    cf,
+                    shard_key(height, hash, shard as u32),
+                    index::silent_payments::encode(&rows),
+                )
+                .unwrap();
+        }
+        // Shards 0 and 10 are deliberately absent. Neither belongs to this page.
+        let reader = db.silent_payments_reader().unwrap();
+        let offset = 41;
+        let (actual_hash, total, rows) =
+            reader.anchored_page(height, height, hash, offset).unwrap();
+        assert_eq!(
+            (actual_hash, total, rows.len()),
+            (hash, count as usize, SP_PAGE_ROWS)
+        );
+        for (position, row) in (offset..).zip(rows) {
+            assert_eq!(
+                &row.txid.as_byte_array()[..4],
+                &(position as u32).to_le_bytes()
+            );
+        }
+        assert!(matches!(
+            reader.anchored_page(height, height, hash, count as usize),
+            Err(SilentPaymentsReadError::InvalidOffset)
+        ));
     }
 }
