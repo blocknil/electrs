@@ -266,8 +266,8 @@ impl Rpc {
 
     fn headers_subscribe(&self, client: &mut Client) -> Result<Value> {
         let headers = self.tracker.headers();
-        let height = headers.tip_height().unwrap();
-        let header = headers.tip().unwrap();
+        let height = headers.tip_height().context("chain index is not ready")?;
+        let header = headers.tip().context("chain index is not ready")?;
         client.tip = Some(header.hash());
         Ok(json!({"hex": serialize_hex(header.header()), "height": height}))
     }
@@ -573,9 +573,18 @@ impl Rpc {
         Ok(json!([self.server_id(), PROTOCOL_VERSION]))
     }
 
+    pub(crate) fn silent_payments_reader(&self) -> Option<bindex::SilentPaymentsReader> {
+        self.tracker.silent_payments_reader()
+    }
+
     fn features(&self) -> Result<Value> {
-        Ok(json!({
-            "genesis_hash": self.tracker.headers().genesis().unwrap().hash(),
+        let genesis = self
+            .tracker
+            .headers()
+            .genesis()
+            .context("chain index is not ready")?;
+        let mut features = json!({
+            "genesis_hash": genesis.hash(),
             "hosts": {
                 self.addr.ip().to_string(): {
                     "tcp_port": self.addr.port()
@@ -586,7 +595,11 @@ impl Rpc {
             "pruning": null,
             "server_version": self.server_id(),
             "hash_function": "sha256"
-        }))
+        });
+        if let Some((start, tip)) = self.tracker.silent_payments_range() {
+            features["silent_payments"] = crate::silent_payments::features(start, tip);
+        }
+        Ok(features)
     }
 
     pub fn handle_requests(&self, client: &mut Client, lines: &[String]) -> Vec<String> {
@@ -822,9 +835,8 @@ fn convert<T>(params: Value) -> std::result::Result<T, StandardError>
 where
     T: serde::de::DeserializeOwned,
 {
-    let params_str = params.to_string();
-    serde_json::from_value(params).map_err(|err| {
-        warn!("invalid params {}: {}", params_str, err);
+    serde_json::from_value(params).map_err(|_| {
+        warn!("invalid RPC parameters");
         StandardError::InvalidParams
     })
 }
@@ -851,13 +863,13 @@ fn parse_requests(line: &str) -> Result<Requests, StandardError> {
         Ok(value) => match serde_json::from_value(value) {
             // parse RPC from JSON
             Ok(requests) => Ok(requests),
-            Err(err) => {
-                warn!("invalid RPC request ({:?}): {}", line, err);
+            Err(_) => {
+                warn!("invalid RPC request");
                 Err(StandardError::InvalidRequest)
             }
         },
-        Err(err) => {
-            warn!("invalid JSON ({:?}): {}", line, err);
+        Err(_) => {
+            warn!("invalid RPC JSON");
             Err(StandardError::ParseError)
         }
     }

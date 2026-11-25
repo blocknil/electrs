@@ -37,11 +37,13 @@ import hashlib
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+from threading import Barrier, Event
 import time
 
 results = []
@@ -172,6 +174,8 @@ def main():
                     help="where to put the datadir and the electrs db (default: a temp dir)")
     ap.add_argument("--keep", action="store_true",
                     help="keep the work dir (and print it) for debugging")
+    ap.add_argument("--with-silent-payments", action="store_true",
+                    help="enable and exercise the Silent Payments index in the scratch database")
     args = ap.parse_args()
 
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -180,8 +184,14 @@ def main():
         sys.exit(f"regtest_smoke: {binary} is not executable (build it, or pass a path)")
 
     bindir = find_bitcoind(args.bitcoind_dir)
-    version_line = subprocess.run([os.path.join(bindir, "bitcoind"), "--version"],
-                                  capture_output=True, text=True).stdout.splitlines()[0]
+    with tempfile.TemporaryDirectory(prefix="electrs-core-version-") as version_dir:
+        probe = subprocess.run([os.path.join(bindir, "bitcoind"), "-regtest",
+                                f"-datadir={version_dir}", "--version"],
+                               capture_output=True, text=True)
+    lines = probe.stdout.splitlines()
+    if probe.returncode or not lines:
+        sys.exit(f"regtest_smoke: could not read the Core version (exit {probe.returncode})")
+    version_line = lines[0]
     found = re.search(r"[Vv]ersion (v[0-9][0-9.]*)", version_line)
     version = found.group(1) if found else ""
     if version != BITCOIND_VERSION:
@@ -208,6 +218,8 @@ def main():
     log = open(os.path.join(work, "electrs.log"), "a")
 
     def start_electrs(*extra):
+        if args.with_silent_payments:
+            extra = ("--index-silent-payments", *extra)
         p = subprocess.Popen([binary, "--network", "regtest", "--daemon-dir", data,
                               "--daemon-rpc-addr", f"127.0.0.1:{rpc_port}",
                               "--db-dir", os.path.join(work, "edb"),
@@ -227,7 +239,8 @@ def main():
 
     def wait_synced(c, height):
         for _ in range(120):
-            if c.ok("blockchain.headers.subscribe")["height"] >= height:
+            reply = c.call("blockchain.headers.subscribe")
+            if reply.get("result", {}).get("height", -1) >= height:
                 return
             time.sleep(0.5)
         raise RuntimeError("electrs did not reach height")
@@ -451,6 +464,8 @@ def main():
         ssh_ = scripthash(json.loads(cli("getaddressinfo", small, wallet="miner"))["scriptPubKey"])
         r = c.ok("blockchain.scripthash.get_history", [ssh_])
         check("index_lookup_limit=5 serves a small address", len(r) == 1, r)
+        if args.with_silent_payments:
+            test_silent_payments(node, c, e_port, mine, sh, wait_synced)
     finally:
         if electrs:
             electrs.terminate()
@@ -473,6 +488,131 @@ def main():
     if args.keep:
         print(f"work dir kept: {work}")
     sys.exit(1 if fails else 0)
+
+
+def test_silent_payments(node, regular, port, miner, scripthash, wait_synced):
+    cli = node.cli
+    method = "blockchain.silent_payments.get"
+    recipient = cli("getnewaddress", "", "bech32m", wallet="miner")
+    txid = cli("sendtoaddress", recipient, "0.01", wallet="miner")
+    cli("generatetoaddress", 2, miner)
+    tip = int(cli("getblockcount"))
+    wait_synced(regular, tip)
+    old_hash = cli("getblockhash", tip - 1)
+    end_hash = cli("getblockhash", tip)
+
+    def request_once(conn, height, end=tip, anchor=end_hash, offset=0):
+        conn.id += 1
+        return conn.send({"jsonrpc": "2.0", "id": conn.id, "method": method,
+                          "params": {"height": height, "end_height": end,
+                                     "end_hash": anchor, "offset": offset}})
+
+    def request(conn, *args, **kwargs):
+        for _ in range(20):
+            response = request_once(conn, *args, **kwargs)
+            error = response.get("error", {})
+            if error.get("code") != -32020:
+                return response
+            time.sleep(error["data"]["retry_after_ms"] / 1000)
+        raise RuntimeError("scan request exceeded its retry budget")
+
+    features = regular.ok("server.features")["silent_payments"]
+    check("Silent Payments advertises available height and limits",
+          features["version"] == 1 and features["indexed_height"] == tip
+          and features["max_range_blocks"] == 128)
+    scan = Electrum(port)
+    first = request(scan, tip - 1)["result"]
+    entry = next((entry for entry in first["entries"] if entry["txid"] == txid), None)
+    output_key = json.loads(cli("getaddressinfo", recipient, wallet="miner"))["scriptPubKey"][4:]
+    check("Silent Payments populated page identifies its block and exact payment output",
+          first["height"] == tip - 1 and first["block_hash"] == old_hash
+          and entry is not None and len(entry["tweak"]) == 66
+          and any(output[1:] == [output_key, 1_000_000] for output in entry["outputs"])
+          and first["next"] == [tip, 0])
+    empty = request(scan, tip)["result"]
+    check("Silent Payments trailing empty block remains distinct",
+          empty["block_hash"] == end_hash and empty["entries"] == [] and empty["next"] is None)
+    check("Silent Payments rejects an oversized range",
+          request(scan, 0, end=128)["error"]["code"] == -32602)
+    check("Silent Payments rejects continuation past the last entry",
+          request(scan, tip - 1, offset=len(first["entries"]))["error"]["code"] == -32602)
+    check("Silent Payments distinguishes unavailable from indexed empty",
+          request(scan, tip + 1, end=tip + 1)["error"]["code"] == -32022)
+    scan.close()
+
+    workers = 12
+    started = Barrier(workers + 1, timeout=10)
+    stop_scans = Event()
+
+    def scan_many():
+        conn = Electrum(port)
+        try:
+            started.wait()
+            completed, busy = 0, 0
+            while not stop_scans.is_set():
+                response = request_once(conn, tip - 1)
+                if "result" in response:
+                    completed += 1
+                elif response.get("error", {}).get("code") == -32020:
+                    busy += 1
+                else:
+                    raise RuntimeError(f"unexpected Silent Payments response: {response}")
+            return completed, busy
+        finally:
+            conn.close()
+
+    def regular_latency():
+        timings = []
+        for _ in range(25):
+            start = time.perf_counter()
+            regular.ok("server.ping")
+            regular.ok("blockchain.block.header", [tip])
+            regular.ok("blockchain.scripthash.get_history_paged", [scripthash])
+            regular.ok("blockchain.transaction.get_merkle", [txid, tip - 1])
+            timings.append((time.perf_counter() - start) * 1000)
+        timings.sort()
+        return timings[23], timings[24]
+
+    idle = regular_latency()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        scanners = [pool.submit(scan_many) for _ in range(workers)]
+        try:
+            started.wait()
+            loaded = regular_latency()
+        finally:
+            stop_scans.set()
+        completed = [future.result() for future in scanners]
+    served = sum(count for count, _ in completed)
+    refused = sum(count for _, count in completed)
+    check("ordinary Electrum RPCs answer during concurrent Silent Payments scans",
+          served > 0,
+          ("four-RPC bundle idle/load p95 %.2f/%.2f ms, p99 %.2f/%.2f ms"
+           " from 25 samples each, %d scans served, %d busy") %
+          (idle[0], loaded[0], idle[1], loaded[1], served, refused))
+
+    # Chain extension preserves an anchor. A replacement at its height invalidates it.
+    cli("generateblock", miner, "[]")
+    wait_synced(regular, tip + 1)
+    scan = Electrum(port)
+    check("Silent Payments continuation survives a chain extension",
+          request(scan, tip)["result"]["block_hash"] == end_hash)
+    cli("invalidateblock", old_hash)
+    new_miner = cli("getnewaddress", wallet="miner")
+    for _ in range(3):
+        cli("generateblock", new_miner, "[]")
+    new_end = cli("getblockhash", tip)
+    for _ in range(100):
+        answer = request(scan, tip, anchor=new_end)
+        if answer.get("result", {}).get("block_hash") == new_end:
+            break
+        time.sleep(0.1)
+    check("Silent Payments rejects a stale anchor after reorg",
+          answer.get("result", {}).get("block_hash") == new_end
+          and request(scan, tip)["error"]["code"] == -32021)
+    replaced = request(scan, tip - 1, anchor=new_end)["result"]
+    check("Silent Payments replacement page contains no orphaned transaction",
+          replaced["block_hash"] != old_hash and replaced["entries"] == [])
+    scan.close()
 
 
 def find_bitcoind(explicit):

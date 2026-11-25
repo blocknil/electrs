@@ -14,6 +14,7 @@ use crate::{
     electrum::{Client, Rpc},
     metrics::{self, Metrics},
     signals::ExitError,
+    silent_payments::{self, ScanPool},
     thread::spawn,
 };
 
@@ -31,11 +32,11 @@ impl Peer {
 
     fn send(&mut self, values: Vec<String>) -> Result<()> {
         for mut value in values {
-            debug!("{}: send {}", self.id, value);
+            debug!("{}: sending RPC response ({} bytes)", self.id, value.len());
             value += "\n";
             self.stream
                 .write_all(value.as_bytes())
-                .with_context(|| format!("failed to send response: {:?}", value))?;
+                .context("failed to send RPC response")?;
         }
         Ok(())
     }
@@ -65,11 +66,6 @@ fn serve() -> Result<()> {
     let metrics = Metrics::new(config.monitoring_addr)?;
 
     let (server_tx, server_rx) = unbounded();
-    if !config.disable_electrum_rpc {
-        let listener = TcpListener::bind(config.electrum_rpc_addr)?;
-        info!("serving Electrum RPC on {}", listener.local_addr()?);
-        spawn("accept_loop", || accept_loop(listener, server_tx)); // detach accepting thread
-    };
 
     let server_batch_size = metrics.histogram_vec(
         "server_batch_size",
@@ -84,6 +80,15 @@ fn serve() -> Result<()> {
         metrics::default_duration_buckets(),
     );
     let mut rpc = Rpc::new(&config, metrics)?;
+
+    if !config.disable_electrum_rpc {
+        let listener = TcpListener::bind(config.electrum_rpc_addr)?;
+        info!("serving Electrum RPC on {}", listener.local_addr()?);
+        let scans = rpc
+            .silent_payments_reader()
+            .map(|reader| ScanPool::new(reader, config.silent_payments_scan_rps));
+        spawn("accept_loop", || accept_loop(listener, server_tx, scans));
+    };
 
     let mut peers = HashMap::<usize, Peer>::new();
     loop {
@@ -200,12 +205,17 @@ fn handle_peer_events(
     }
 }
 
-fn accept_loop(listener: TcpListener, server_tx: Sender<Event>) -> Result<()> {
+fn accept_loop(
+    listener: TcpListener,
+    server_tx: Sender<Event>,
+    scans: Option<ScanPool>,
+) -> Result<()> {
     for (peer_id, conn) in listener.incoming().enumerate() {
         let stream = conn.context("failed to accept")?;
         let tx = server_tx.clone();
+        let scans = scans.clone();
         spawn("recv_loop", move || {
-            let result = recv_loop(peer_id, &stream, tx);
+            let result = recv_loop(peer_id, &stream, tx, scans.as_ref());
             if let Err(e) = stream.shutdown(Shutdown::Read) {
                 warn!("{}: failed to shutdown TCP receiving {}", peer_id, e)
             }
@@ -215,22 +225,49 @@ fn accept_loop(listener: TcpListener, server_tx: Sender<Event>) -> Result<()> {
     Ok(())
 }
 
-fn recv_loop(peer_id: usize, stream: &TcpStream, server_tx: Sender<Event>) -> Result<()> {
+fn recv_loop(
+    peer_id: usize,
+    stream: &TcpStream,
+    server_tx: Sender<Event>,
+    scans: Option<&ScanPool>,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream);
+    let first = if let Some(scans) = scans {
+        let mut line = String::new();
+        if !silent_payments::read_line(&mut reader, &mut line, 8 * 1024 * 1024)? {
+            return Ok(());
+        }
+        if silent_payments::is_scan(&line) {
+            let result = scans.run(stream, reader, line);
+            let _ = stream.shutdown(Shutdown::Both);
+            return result.context("Silent Payments connection failed");
+        }
+        Some(Ok(line))
+    } else {
+        None
+    };
+
     let msg = Message::New(stream.try_clone()?);
     server_tx.send(Event { peer_id, msg })?;
-
-    let mut first_line = true;
-    for line in BufReader::new(stream).lines() {
+    for (index, line) in first.into_iter().chain(reader.lines()).enumerate() {
         if let Err(e) = &line {
-            if first_line && e.kind() == std::io::ErrorKind::InvalidData {
-                warn!("InvalidData on first line may indicate client attempted to connect using SSL when server expects unencrypted communication.")
+            if index == 0 && e.kind() == std::io::ErrorKind::InvalidData {
+                warn!("InvalidData on first line may indicate client attempted to connect using SSL when server expects unencrypted communication.");
             }
         }
-        let line = line.with_context(|| format!("{}: recv failed", peer_id))?;
-        debug!("{}: recv {}", peer_id, line);
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                server_tx.send(Event {
+                    peer_id,
+                    msg: Message::Done,
+                })?;
+                return Err(err).with_context(|| format!("{}: recv failed", peer_id));
+            }
+        };
+        debug!("{}: received RPC request ({} bytes)", peer_id, line.len());
         let msg = Message::Request(line);
         server_tx.send(Event { peer_id, msg })?;
-        first_line = false;
     }
 
     debug!("{}: disconnected", peer_id);

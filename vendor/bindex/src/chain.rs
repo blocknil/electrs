@@ -32,6 +32,12 @@ pub enum Error {
 
     #[error("block not found: {0}")]
     BlockNotFound(#[from] headers::Reorg),
+
+    #[error("Silent Payments requires a fresh or already enabled bindex database")]
+    SilentPaymentsFormat,
+
+    #[error("missing Silent Payments index for block={0} at height={1}")]
+    SilentPaymentsMissing(BlockHash, u32),
 }
 
 #[derive(Debug)]
@@ -59,6 +65,7 @@ pub struct IndexedChain {
     client: client::Client,
     store: db::DB,
     chunk_size: usize,
+    silent_payments_start: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -88,10 +95,17 @@ struct PerBlockData {
 struct Builder<'a> {
     items: Vec<(index::TxNumRange, &'a PerBlockData)>,
     tip: BlockHash,
+    first_height: usize,
+    silent_payments_start: Option<u32>,
 }
 
 impl<'a> Builder<'a> {
-    fn new(tip: Option<&index::IndexedHeader>, items: &'a [PerBlockData]) -> Self {
+    fn new(
+        tip: Option<&index::IndexedHeader>,
+        items: &'a [PerBlockData],
+        first_height: usize,
+        silent_payments_start: Option<u32>,
+    ) -> Self {
         let mut next_txnum = tip.map_or_else(index::TxNum::default, |header| header.next_txnum());
         let tip = tip.map_or_else(bitcoin::BlockHash::all_zeros, |header| header.hash());
 
@@ -104,7 +118,12 @@ impl<'a> Builder<'a> {
                 (range, data)
             })
             .collect();
-        Self { items, tip }
+        Self {
+            items,
+            tip,
+            first_height,
+            silent_payments_start,
+        }
     }
 
     fn build(self) -> Result<Vec<index::Batch>, Error> {
@@ -116,7 +135,8 @@ impl<'a> Builder<'a> {
         let batches = self
             .items
             .into_par_iter()
-            .map(|(txnum_range, data)| {
+            .enumerate()
+            .map(|(offset, (txnum_range, data))| {
                 let PerBlockData {
                     blockhash,
                     block_bytes,
@@ -124,7 +144,17 @@ impl<'a> Builder<'a> {
                     txs_count,
                 } = data;
                 assert_eq!(txnum_range.len(), *txs_count);
-                index::Batch::build(txnum_range, *blockhash, block_bytes, spent_bytes)
+                let mut batch =
+                    index::Batch::build(txnum_range, *blockhash, block_bytes, spent_bytes)?;
+                let height =
+                    u32::try_from(self.first_height + offset).expect("block height fits u32");
+                if self
+                    .silent_payments_start
+                    .is_some_and(|start| height >= start)
+                {
+                    batch.index_silent_payments(height, block_bytes, spent_bytes)?;
+                }
+                Ok(batch)
             })
             .collect::<Result<Vec<_>, index::Error>>()?;
         let mut tip = self.tip;
@@ -158,10 +188,33 @@ impl IndexedChain {
     ) -> Result<Self, Error> {
         let db_path = db_dir.as_ref().to_path_buf().join(network.to_string());
         let url = url.unwrap_or_else(|| format!("http://localhost:{}", default_rpc_port(network)));
-        Self::from_config(Config { db_path, url })
+        Self::from_config(Config { db_path, url }, None)
     }
 
-    fn from_config(config: Config) -> Result<Self, Error> {
+    /// Use a separate index directory. Legacy indexes lack the historical tweak rows.
+    pub fn open_with_silent_payments(
+        db_dir: impl AsRef<Path>,
+        network: Network,
+        url: Option<String>,
+    ) -> Result<Self, Error> {
+        let db_path = db_dir.as_ref().join(network.to_string());
+        let url = url.unwrap_or_else(|| format!("http://localhost:{}", default_rpc_port(network)));
+        let start = if network == Network::Bitcoin {
+            709_632
+        } else {
+            0
+        };
+        Self::from_config(Config { db_path, url }, Some(start))
+    }
+
+    fn from_config(config: Config, silent_payments_start: Option<u32>) -> Result<Self, Error> {
+        let silent_payments = silent_payments_start.is_some();
+        if silent_payments
+            && config.db_path.join("CURRENT").exists()
+            && !db::DB::has_silent_payments(&config.db_path)?
+        {
+            return Err(Error::SilentPaymentsFormat);
+        }
         info!("index: {:?}", config);
         let chunk_size = rayon::current_num_threads();
         let agent = ureq::Agent::new_with_config(
@@ -194,7 +247,7 @@ impl IndexedChain {
             res => assert_eq!(index::BlockBytes::new(res?), genesis_block),
         };
 
-        let store = db::DB::open(config.db_path)?;
+        let store = db::DB::open(config.db_path, silent_payments)?;
         let headers = headers::Headers::new(store.headers()?);
         if let Some(indexed_genesis) = headers.genesis() {
             if indexed_genesis.hash() != genesis_hash {
@@ -212,20 +265,54 @@ impl IndexedChain {
             client,
             store,
             chunk_size,
+            silent_payments_start,
         })
     }
 
     fn drop_tip(&mut self) -> Result<bitcoin::BlockHash, Error> {
+        let height = self
+            .headers
+            .tip_height()
+            .expect("cannot drop tip of an empty chain");
         let stale = self
             .headers
-            .pop()
+            .tip()
             .expect("cannot drop tip of an empty chain");
-        // "Re-index" stale block in order to delete its entries from the DB
-        // let stale_hash = stale.hash();
-        // let mut builder: index::IndexBuilder = index::IndexBuilder::new(self.headers.tip());
-        // builder.add(stale_hash, &self.fetch_data(stale_hash)?)?;
-        self.store.delete(&self.index(&[*stale.header()], None)?)?;
-        Ok(stale.hash())
+        let hash = stale.hash();
+        let mut batches = self.index(&[*stale.header()], height, None, None)?;
+        let height = u32::try_from(height).expect("block height fits u32");
+        if self
+            .silent_payments_start
+            .is_some_and(|start| height >= start)
+        {
+            // Delete by the stored identity, without re-deriving the original tweak bytes.
+            batches[0].silent_payments = Some((height, Vec::new()));
+        }
+        self.store.delete(&batches)?;
+        self.headers.pop();
+        Ok(hash)
+    }
+
+    pub fn silent_payments_reader(&self) -> Option<crate::SilentPaymentsReader> {
+        self.store.silent_payments_reader()
+    }
+
+    pub fn silent_payments_start(&self) -> Option<u32> {
+        self.silent_payments_start
+    }
+
+    /// Read a complete record for a canonical block, including an explicitly empty one.
+    pub fn silent_payment_block(
+        &self,
+        height: u32,
+        hash: BlockHash,
+    ) -> Result<Vec<crate::SilentPaymentEntry>, Error> {
+        self.headers.get_header(hash, height as usize)?;
+        let row = self
+            .store
+            .silent_payment_block(height, hash)?
+            .ok_or(Error::SilentPaymentsMissing(hash, height))?;
+        Ok(index::silent_payments::decode(&row)?)
     }
 
     fn fetch_new_headers(&mut self, limit: usize) -> Result<HeaderChunk, Error> {
@@ -267,21 +354,29 @@ impl IndexedChain {
     fn index(
         &self,
         headers: &[bitcoin::block::Header],
+        first_height: usize,
+        silent_payments_start: Option<u32>,
         mut stats: Option<&mut Stats>,
     ) -> Result<Vec<index::Batch>, Error> {
         use rayon::prelude::*;
 
         let mut batches = Vec::with_capacity(headers.len());
-        for chunk in headers.chunks(self.chunk_size) {
+        for (chunk_index, chunk) in headers.chunks(self.chunk_size).enumerate() {
             let items: Vec<_> = chunk
                 .par_iter()
                 .map(|header| self.fetch_data(header.block_hash()))
                 .collect::<Result<Vec<_>, Error>>()?;
 
-            let tip = batches
-                .last()
-                .map_or_else(|| self.headers.tip(), |b: &index::Batch| Some(&b.header));
-            batches.extend(Builder::new(tip, &items).build()?);
+            let tip = batches.last().map_or_else(
+                || {
+                    first_height
+                        .checked_sub(1)
+                        .and_then(|height| self.headers.at_height(height))
+                },
+                |b: &index::Batch| Some(&b.header),
+            );
+            let height = first_height + chunk_index * self.chunk_size;
+            batches.extend(Builder::new(tip, &items, height, silent_payments_start).build()?);
 
             for item in items {
                 if let Some(s) = stats.as_mut() {
@@ -302,7 +397,13 @@ impl IndexedChain {
         let chunk = self.fetch_new_headers(limit)?;
         // start indexing from a valid tip
         let mut stats = Stats::new(self.headers.tip_hash());
-        let batches = self.index(chunk.get(), Some(&mut stats))?;
+        let first_height = self.headers.tip_height().map_or(0, |height| height + 1);
+        let batches = self.index(
+            chunk.get(),
+            first_height,
+            self.silent_payments_start,
+            Some(&mut stats),
+        )?;
         self.store.write(&batches)?;
         for batch in batches {
             self.headers.add(batch.header);
@@ -454,7 +555,7 @@ mod tests {
             db_path: dir.path().to_path_buf(),
             url: format!("http://{}", node.params.rpc_socket),
         };
-        let mut chain = IndexedChain::from_config(config).unwrap();
+        let mut chain = IndexedChain::from_config(config, None).unwrap();
         let stats = chain.sync(1000).unwrap();
         assert_eq!(stats.indexed_blocks, BLOCKS + 1);
         assert_eq!(stats.tip, get_tip());
@@ -487,7 +588,9 @@ mod tests {
             .transaction()
             .unwrap();
         node.client.generate_to_address(1, &addr).unwrap();
-        assert_eq!(node.client.get_mempool_info().unwrap().size, 0);
+        // Core 32 omits fullrbf, which older corepc models require.
+        let mempool: serde_json::Value = node.client.call("getmempoolinfo", &[]).unwrap();
+        assert_eq!(mempool["size"].as_u64(), Some(0));
 
         let stats = chain.sync(1000).unwrap();
         assert_eq!(stats.indexed_blocks, 1);
@@ -551,6 +654,147 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn silent_payments_follow_the_canonical_block_after_restart_and_reorg() {
+        use bitcoin::{consensus::encode::deserialize_hex, Txid};
+        use serde_json::{json, Value};
+        use silentpayments::utils::{
+            receiving::{calculate_tweak_data, get_pubkey_from_input},
+            OutPoint as SpOutPoint,
+        };
+
+        let mut conf = Conf::default();
+        conf.args.extend(["-rest", "-txindex=1"]);
+        let node = Node::with_conf(exe_path().unwrap(), &conf).unwrap();
+        let rpc = |method: &str, args: &[Value]| node.client.call::<Value>(method, args).unwrap();
+        let miner = rpc("getnewaddress", &[json!(""), json!("bech32")]);
+        rpc("generatetoaddress", &[json!(105), miner.clone()]);
+        let recipient = rpc("getnewaddress", &[json!(""), json!("bech32m")]);
+        let txid: Txid = rpc("sendtoaddress", &[recipient, json!(0.01)])
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        rpc("generatetoaddress", &[json!(1), miner]);
+        let old: BlockHash = rpc("getbestblockhash", &[])
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let height = 106;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let url = || Some(format!("http://{}", node.params.rpc_socket));
+        let opt_in = || {
+            IndexedChain::open_with_silent_payments(dir.path(), Network::Regtest, url()).unwrap()
+        };
+        let mut chain = opt_in();
+        chain.sync(1000).unwrap();
+
+        // Independently derive each candidate from the canonical raw block and Core's raw prevouts.
+        let raw = rpc("getblock", &[json!(old), json!(0)]);
+        let block: bitcoin::Block = deserialize_hex(raw.as_str().unwrap()).unwrap();
+        let mut expected = Vec::new();
+        for tx in &block.txdata {
+            let outputs: Vec<_> = tx
+                .output
+                .iter()
+                .enumerate()
+                .filter(|(_, out)| out.script_pubkey.is_p2tr())
+                .map(|(vout, out)| crate::SilentPaymentOutput {
+                    vout: vout as u32,
+                    key: out.script_pubkey.as_bytes()[2..].try_into().unwrap(),
+                    sats: out.value.to_sat(),
+                })
+                .collect();
+            if tx.is_coinbase() || outputs.is_empty() {
+                continue;
+            }
+            let mut keys = Vec::new();
+            let mut outpoints = Vec::new();
+            for input in &tx.input {
+                let outpoint = input.previous_output;
+                let raw = rpc("getrawtransaction", &[json!(outpoint.txid)]);
+                let parent: Transaction = deserialize_hex(raw.as_str().unwrap()).unwrap();
+                if let Some(key) = get_pubkey_from_input(
+                    input.script_sig.as_bytes(),
+                    &input.witness.to_vec(),
+                    parent.output[outpoint.vout as usize]
+                        .script_pubkey
+                        .as_bytes(),
+                )
+                .unwrap()
+                {
+                    keys.push(key);
+                }
+                outpoints.push(SpOutPoint::from_txid_bytes_and_vout(
+                    outpoint.txid.to_byte_array(),
+                    outpoint.vout,
+                ));
+            }
+            if !keys.is_empty() {
+                let tweak = calculate_tweak_data(&keys.iter().collect::<Vec<_>>(), &outpoints)
+                    .unwrap()
+                    .serialize();
+                expected.push(crate::SilentPaymentEntry {
+                    txid: tx.compute_txid(),
+                    tweak,
+                    outputs,
+                });
+            }
+        }
+        assert!(expected.iter().any(|row| row.txid == txid));
+        assert_eq!(chain.silent_payment_block(height, old).unwrap(), expected);
+        drop(chain);
+        let mut chain = opt_in();
+        assert_eq!(chain.silent_payment_block(height, old).unwrap(), expected);
+
+        rpc("invalidateblock", &[json!(old)]);
+        let miner = rpc("getnewaddress", &[json!(""), json!("bech32")]);
+        let replacement = rpc("generateblock", &[miner.clone(), json!([])]);
+        let replacement: BlockHash = replacement["hash"].as_str().unwrap().parse().unwrap();
+        assert_ne!(old, replacement);
+        assert_eq!(chain.sync(1000).unwrap().tip, replacement);
+        assert!(chain.silent_payment_block(height, old).is_err());
+        assert!(chain
+            .store
+            .silent_payment_block(height, old)
+            .unwrap()
+            .is_none());
+        assert!(chain
+            .silent_payment_block(height, replacement)
+            .unwrap()
+            .is_empty());
+        drop(chain);
+
+        let mut chain = opt_in();
+        let extension = rpc("generateblock", &[miner, json!([])]);
+        let extension: BlockHash = extension["hash"].as_str().unwrap().parse().unwrap();
+        assert_eq!(chain.sync(1000).unwrap().tip, extension);
+        assert!(chain
+            .silent_payment_block(height + 1, extension)
+            .unwrap()
+            .is_empty());
+        assert!(chain
+            .silent_payment_block(height, replacement)
+            .unwrap()
+            .is_empty());
+        assert!(chain
+            .store
+            .silent_payment_block(height, old)
+            .unwrap()
+            .is_none());
+
+        let legacy_dir = tempfile::TempDir::new().unwrap();
+        let legacy = IndexedChain::open(legacy_dir.path(), Network::Regtest, url()).unwrap();
+        drop(legacy);
+        assert!(matches!(
+            IndexedChain::open_with_silent_payments(legacy_dir.path(), Network::Regtest, url()),
+            Err(Error::SilentPaymentsFormat)
+        ));
+        IndexedChain::open(legacy_dir.path(), Network::Regtest, url()).unwrap();
     }
 
     fn exactly_one<T>(mut iter: impl Iterator<Item = T>) -> T {

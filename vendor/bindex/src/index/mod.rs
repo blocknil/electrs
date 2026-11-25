@@ -1,5 +1,6 @@
 mod header;
 mod scripthash;
+pub(crate) mod silent_payments;
 mod txid;
 mod txpos;
 
@@ -20,6 +21,9 @@ pub enum Error {
 
     #[error("{0} bytes were not parsed")]
     Leftover(usize),
+
+    #[error("spent outputs do not align with the block's inputs")]
+    SpentAlignment,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
@@ -209,9 +213,20 @@ pub struct Batch {
     pub txid_rows: Vec<HashPrefixRow>,
     pub txpos_rows: Vec<txpos::TxBlockPosRow>,
     pub header: IndexedHeader,
+    pub(crate) silent_payments: Option<(u32, Vec<u8>)>,
 }
 
 impl Batch {
+    pub fn index_silent_payments(
+        &mut self,
+        height: u32,
+        block: &BlockBytes,
+        spent: &SpentBytes,
+    ) -> Result<(), Error> {
+        self.silent_payments = Some((height, silent_payments::index(block, spent)?));
+        Ok(())
+    }
+
     pub fn build(
         txnum_range: TxNumRange,
         blockhash: BlockHash,
@@ -233,6 +248,7 @@ impl Batch {
             txpos_rows: txpos.rows,
             txid_rows: txid.rows,
             header: IndexedHeader::new(txnum_range.next, blockhash, block),
+            silent_payments: None,
         })
     }
 }

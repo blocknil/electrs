@@ -16,6 +16,7 @@ use crate::{
 /// Electrum protocol subscriptions' tracker
 pub struct Tracker {
     index: IndexedChain,
+    sync_batch_size: usize,
     mempool: Mempool,
     ignore_mempool: bool,
     /// Cap on how many confirmed history entries one script hash may have.
@@ -47,14 +48,38 @@ pub(crate) struct HistoryPageEntry {
 impl Tracker {
     pub fn new(config: &Config, metrics: Metrics) -> Result<Self> {
         let url = format!("http://{}", config.daemon_rpc_addr);
-        let index = IndexedChain::open(&config.db_dir, config.network, Some(url))
-            .context("failed to open index")?;
+        let index = if config.index_silent_payments {
+            IndexedChain::open_with_silent_payments(&config.db_dir, config.network, Some(url))
+        } else {
+            IndexedChain::open(&config.db_dir, config.network, Some(url))
+        }
+        .context("failed to open index")?;
         Ok(Self {
             index,
+            // Offline index construction has no peers to wait on its durable writes and flushes.
+            // Keep the smaller batch while serving wallets, since tweak derivation adds CPU.
+            sync_batch_size: match (config.index_silent_payments, config.disable_electrum_rpc) {
+                (true, true) => 256,
+                (true, false) => 32,
+                (false, _) => 1000,
+            },
             mempool: Mempool::new(&metrics),
             ignore_mempool: config.ignore_mempool,
             lookup_limit: config.index_lookup_limit,
         })
+    }
+
+    pub(crate) fn silent_payments_reader(&self) -> Option<bindex::SilentPaymentsReader> {
+        self.index.silent_payments_reader()
+    }
+
+    pub(crate) fn silent_payments_range(&self) -> Option<(u32, Option<usize>)> {
+        let start = self.index.silent_payments_start()?;
+        let tip = self
+            .headers()
+            .tip_height()
+            .filter(|height| *height >= start as usize);
+        Some((start, tip))
     }
 
     pub(crate) fn headers(&self) -> &bindex::Headers {
@@ -71,7 +96,7 @@ impl Tracker {
 
     pub(crate) fn sync(&mut self, daemon: &Daemon, exit_flag: &ExitFlag) -> Result<bool> {
         exit_flag.poll()?;
-        let stats = self.index.sync(1000)?;
+        let stats = self.index.sync(self.sync_batch_size)?;
         let done = stats.indexed_blocks == 0;
         if done && !self.ignore_mempool {
             self.mempool.sync(daemon, exit_flag);
