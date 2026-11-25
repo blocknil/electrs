@@ -136,3 +136,13 @@ default = "concat!(\"Welcome to electrs \", env!(\"CARGO_PKG_VERSION\"), \" (Ele
 name = "log_filters"
 type = "String"
 doc = "Logging filters, overriding `RUST_LOG` environment variable (see https://docs.rs/env_logger/ for details)"
+
+[[switch]]
+name = "index_silent_payments"
+doc = "Build and serve the experimental Silent Payments index. Requires a separate database directory."
+
+[[param]]
+name = "silent_payments_scan_rps"
+type = "u64"
+doc = "Maximum admitted Silent Payments block pages per second across all connections (1 to 4096)."
+default = "128"

@@ -147,3 +147,146 @@ method our clients use, `blockchain.scripthash.get_history_paged` in every shape
 `index_lookup_limit` refusal. Its expectations come from bitcoind (`getblock ... 3`), not from
 electrs, so the two cannot agree on something wrong. Pass `--bitcoind-dir` if Core 32.1 is not
 at `~/core-releases/32.1`.
+
+## Silent Payments block index
+
+`IndexedChain::open_with_silent_payments` is the opt-in storage entry point.
+Use a separate database directory. A legacy directory lacks historical rows
+and is rejected before opening it for writes. Set
+`--index-silent-payments` to enable it on a scratch or staging index.
+
+The index uses the block and spent outputs already fetched from Core. Each
+record is keyed by height and block hash. The record includes all eligible
+transactions and their Taproot outputs, including spent outputs and small
+amounts. An empty record represents a fully indexed block with no tweaks.
+RocksDB writes and deletes the record with the regular block records. On
+rollback, the stored block identity determines which tweak record to delete.
+
+Run the vendored bindex suite against our pinned Bitcoin Core 32.1 release
+using `BITCOIND_EXE=/absolute/path/to/bitcoind cargo test --locked
+--manifest-path vendor/bindex/Cargo.toml`. The Silent Payments regtest compares
+all rows of the fixture block with SPDK, reopens the database, replaces the
+block at the same height, and verifies the old row stays absent after
+restart and branch extension.
+
+### Experimental Electrum endpoint
+
+`server.features` advertises the version and indexed range on an ordinary
+connection. Fetch pages on a dedicated connection to the same port. Its
+first request selects the scan protocol, and each request is standalone.
+A minimal parameter object follows.
+
+```json
+{"height":106,"end_height":107,"end_hash":"<hash of block 107>","offset":0}
+```
+
+Use JSON-RPC method `blockchain.silent_payments.get`. A page returns the
+block height and hash, echoed anchor, entry offset, entries, and `next`
+as `[height, offset]` or null. Each entry has the txid, compressed public
+tweak and outputs as `[vout, x_only_key_hex, sats]`. An empty indexed block
+returns an empty entry list. Unknown or unindexed blocks return -32022.
+A changed anchor returns -32021. A saturated or expired queue returns
+retryable -32020. Restart at a fresh anchor on a chain change.
+
+The handler checks the anchor and block records from one RocksDB snapshot.
+There are two scan workers and eight queue slots. Each request covers one
+block page, up to 256 entries and 4 MiB on the wire. A requested range can
+cover at most 128 blocks. Responses and writes run outside the normal
+Electrum event loop. When serving Electrum, the enabled index syncs in
+32-block batches. Offline builds with `--disable-electrum-rpc` use
+256-block batches to reduce repeated WAL syncs and flushes.
+
+Run `contrib/regtest_smoke.py --with-silent-payments <electrs-binary>`
+for the enabled endpoint, anchor and reorg checks and a local concurrent
+scan smoke test. Repeat without the flag for the disabled path. Mainnet
+backfill, device profiling and release load gates need separate validation.
+
+### Paired local benchmark
+
+Build the patched baseline and candidate in separate Cargo target directories
+with the same toolchain and release profile. Run the benchmark on the pinned
+Bitcoin Core 32.1 regtest release.
+
+```sh
+python3 -B contrib/regtest_sp_bench.py /path/to/baseline/electrs /path/to/candidate/electrs \
+  --bitcoind-dir /path/to/bitcoin-32.1/bin
+```
+
+The harness generates one disposable chain, gives every run a fresh database
+and rotates the order of the three variants. It measures backfill wall time,
+electrs CPU and peak RSS, allocated database size, and steady-state latency for
+a bundle of ping, header, paged history and Merkle proof calls. During the
+loaded run, concurrent clients in a separate load-generator process scan
+over the fixture's transaction-bearing blocks. Ordinary RPC result fingerprints
+must match across all three variants.
+The JSON report includes individual trials and medians.
+
+On an arm64 Mac with 12 logical CPUs, the fixture used 1,661 blocks, 1,536
+eligible transactions, and 3,072 Taproot outputs. Three rotated release-build
+trials on the same Core 32.1 chain gave these medians.
+
+| Variant | Backfill wall | electrs CPU | Peak RSS | Final database | Peak database |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Patched baseline `dfd1aad` | 0.231 s | 0.374 s | 20.3 MB | 0.532 MB | 0.541 MB |
+| Candidate, tweaks disabled | 0.235 s | 0.393 s | 20.6 MB | 0.532 MB | 0.532 MB |
+| Candidate, tweaks enabled | 0.325 s | 0.529 s | 23.5 MB | 0.983 MB | 1.012 MB |
+
+The earlier enabled build took 0.832 s wall time, 1.074 s CPU and 3.006 MB
+peak database space on the same fixture. The tuned build groups more
+blocks per durable write during offline backfill and avoids pre-serializing
+every response entry just to calculate its maximum size.
+
+At 12 sustained scan clients, the tuned build's ordinary four-RPC bundle
+went from 1.84 to 3.40 ms p95 and from 2.39 to 3.62 ms p99. Across the
+three loaded trials, the median run served 2,450 pages and returned
+1,458 retryable busy responses. Ordinary RPCs completed successfully and
+result fingerprints matched. The latency increase exceeds the proposed
++10% p95 and +20% p99 budgets in this local test.
+
+The fixture has many coinbase-only blocks and repeats recipient scripts.
+Its storage and compaction measurements are only for local comparison.
+Mainnet backfill, cold storage reads, real wallet and LDK workloads, and
+staging performance remain open.
+
+### Scan admission and real wallet sync
+
+The scan service admits at most 128 block pages per second by default across
+all connections. Operators can change the experimental ceiling with
+`--silent-payments-scan-rps` in the range 1 to 4096. An excess request receives
+`-32020` and `error.data.retry_after_ms`. The server backs off that connection
+before reading its next request. The existing queue and response size limits
+still apply. The candidate also returns a readiness error for header
+subscriptions before genesis is indexed.
+
+Build `core/examples/electrum_scan_probe.rs` from wallet source and pass its
+binary to the local driver. It uses fresh regtest wallets and the production
+`WalletCore::sync_onchain` and LDK `Node::sync_wallets` entry points.
+
+```sh
+python3 -B contrib/regtest_sp_wallet_bench.py \
+  /path/to/baseline/electrs /path/to/candidate/electrs /path/to/electrum_scan_probe \
+  --bitcoind-dir /path/to/bitcoin-32.1/bin
+```
+
+Three rotated Core 32.1 trials used the patched electrs baseline `dfd1aad`,
+wallet source `2e64893`, and 12 concurrent scanning connections over 24
+blocks with 64 eligible transactions each. Each mode measured one initial
+sync and 40 follow-up syncs per trial. Every sample preserved both confirmed
+test balances.
+
+| Admission ceiling | Blocknil wallet p95 idle / loaded | LDK p95 idle / loaded |
+| ---: | ---: | ---: |
+| 128 pages/s | 0.83 / 0.83 ms | 3.30 / 3.20 ms |
+| 256 pages/s | 0.88 / 1.00 ms | 3.50 / 3.35 ms |
+| 1,024 pages/s | 0.76 / 0.77 ms | 2.88 / 3.03 ms |
+
+At the selected 128 ceiling, competing clients delivered about 22–31
+successful pages/s in these trials. The rest received retryable busy
+responses. A separate paced run used 120 follow-up syncs per trial and
+served about 88 pages/s with no busy responses. At that rate, the loaded
+wallet and LDK p95 were 0.69 and 2.70 ms. LDK p99 was 3.97 ms, versus
+3.55 ms with the candidate idle and 3.11 ms on the patched baseline.
+The baseline-relative p99 exceeds the proposed 20% budget. These
+measurements cover on-chain and LDK wallet sync to a fixed chain tip.
+The full admission ceiling, active Lightning channel traffic under
+scan load, and mainnet backfill and compaction still need validation.

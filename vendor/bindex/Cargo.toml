@@ -88,3 +88,7 @@ version = "0.1"
 
 [dev-dependencies.tempfile]
 version = "3"
+
+[dev-dependencies.silentpayments]
+git = "https://github.com/cygnet3/spdk"
+rev = "afae84ae1ac89747586c02d66f85e857fbe899fb"

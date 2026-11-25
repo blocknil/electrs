@@ -65,6 +65,10 @@ impl Headers {
         self.rows.iter()
     }
 
+    pub(crate) fn at_height(&self, height: usize) -> Option<&index::IndexedHeader> {
+        self.rows.get(height)
+    }
+
     pub fn get_header(
         &self,
         hash: BlockHash,

@@ -136,6 +136,8 @@ pub struct Config {
     pub wait_duration: Duration,
     pub jsonrpc_timeout: Duration,
     pub index_lookup_limit: Option<usize>,
+    pub index_silent_payments: bool,
+    pub silent_payments_scan_rps: u64,
     pub reindex_last_blocks: usize,
     pub auto_reindex: bool,
     pub ignore_mempool: bool,
@@ -297,6 +299,11 @@ impl Config {
             std::process::exit(1);
         }
 
+        if !(1..=4096).contains(&config.silent_payments_scan_rps) {
+            eprintln!("Error: silent_payments_scan_rps must be between 1 and 4096");
+            std::process::exit(1);
+        }
+
         if config.version {
             println!("v{}", ELECTRS_VERSION);
             std::process::exit(0);
@@ -314,6 +321,8 @@ impl Config {
             wait_duration: Duration::from_secs(config.wait_duration_secs),
             jsonrpc_timeout: Duration::from_secs(config.jsonrpc_timeout_secs),
             index_lookup_limit,
+            index_silent_payments: config.index_silent_payments,
+            silent_payments_scan_rps: config.silent_payments_scan_rps,
             reindex_last_blocks: config.reindex_last_blocks,
             auto_reindex: config.auto_reindex,
             ignore_mempool: config.ignore_mempool,

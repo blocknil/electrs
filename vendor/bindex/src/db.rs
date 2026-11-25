@@ -1,4 +1,5 @@
-use std::path::Path;
+use bitcoin::hashes::Hash;
+use std::{path::Path, sync::Arc};
 
 use crate::index::{self, TxBlockPosRow};
 
@@ -7,8 +8,9 @@ use rust_rocksdb as rocksdb;
 
 /// Key-value database
 pub struct DB {
-    db: rocksdb::DB,
+    db: Arc<rocksdb::DB>,
     compacting: bool,
+    silent_payments: bool,
 }
 
 fn default_opts() -> rocksdb::Options {
@@ -35,6 +37,7 @@ const CONFIG_CF: &str = "config";
 const CONFIG_KEY: &[u8] = b"C";
 
 const HEADERS_CF: &str = "headers";
+const SILENT_PAYMENTS_CF: &str = "silent_payments_v2";
 const SCRIPT_HASH_CF: &str = "script_hash";
 const TXPOS_CF: &str = "txpos";
 const TXID_CF: &str = "txid";
@@ -60,22 +63,30 @@ struct Config {
     format: u64, // bumped to enforce reindexing
 }
 
-fn cf_descriptors(
-    opts: &rocksdb::Options,
-) -> impl IntoIterator<Item = rocksdb::ColumnFamilyDescriptor> + '_ {
+fn column_families(silent_payments: bool) -> impl Iterator<Item = &'static str> {
     COLUMN_FAMILIES
         .iter()
-        .map(|&name| rocksdb::ColumnFamilyDescriptor::new(name, opts.clone()))
+        .copied()
+        .chain(silent_payments.then_some(SILENT_PAYMENTS_CF))
 }
 
 impl DB {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, rocksdb::Error> {
+    pub fn has_silent_payments(path: &Path) -> Result<bool, rocksdb::Error> {
+        Ok(rocksdb::DB::list_cf(&default_opts(), path)?
+            .iter()
+            .any(|name| name == SILENT_PAYMENTS_CF))
+    }
+
+    pub fn open(path: impl AsRef<Path>, silent_payments: bool) -> Result<Self, rocksdb::Error> {
         let opts = default_opts();
-        let db = rocksdb::DB::open_cf_descriptors(&opts, path, cf_descriptors(&opts))?;
+        let descriptors = column_families(silent_payments)
+            .map(|name| rocksdb::ColumnFamilyDescriptor::new(name, opts.clone()));
+        let db = rocksdb::DB::open_cf_descriptors(&opts, path, descriptors)?;
 
         let store = Self {
-            db,
+            db: Arc::new(db),
             compacting: false,
+            silent_payments,
         };
 
         if let Some(config) = store.get_config()? {
@@ -88,7 +99,7 @@ impl DB {
             }
         }
 
-        for &cf_name in COLUMN_FAMILIES {
+        for cf_name in column_families(silent_payments) {
             let cf = store.cf(cf_name);
             let metadata = store.db.get_column_family_metadata_cf(cf);
             info!(
@@ -161,9 +172,45 @@ impl DB {
             f(&mut write_batch, cf, &key, &value);
         }
 
-        let opts = rocksdb::WriteOptions::default();
+        if self.silent_payments {
+            let cf = self.cf(SILENT_PAYMENTS_CF);
+            for batch in batches {
+                if let Some((height, entries)) = &batch.silent_payments {
+                    let key = silent_payments_key(*height, batch.header.hash());
+                    f(&mut write_batch, cf, &key, entries);
+                    f(
+                        &mut write_batch,
+                        cf,
+                        &canonical_key(*height),
+                        batch.header.hash().as_byte_array(),
+                    );
+                }
+            }
+        }
+
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(self.silent_payments);
         self.db.write_opt(write_batch, &opts)?;
         Ok(())
+    }
+
+    pub fn silent_payment_block(
+        &self,
+        height: u32,
+        hash: bitcoin::BlockHash,
+    ) -> Result<Option<Vec<u8>>, rocksdb::Error> {
+        if !self.silent_payments {
+            return Ok(None);
+        }
+        self.db.get_cf(
+            self.cf(SILENT_PAYMENTS_CF),
+            silent_payments_key(height, hash),
+        )
+    }
+
+    pub fn silent_payments_reader(&self) -> Option<SilentPaymentsReader> {
+        self.silent_payments
+            .then(|| SilentPaymentsReader(Arc::clone(&self.db)))
     }
 
     pub fn write(&self, batches: &[index::Batch]) -> Result<(), rocksdb::Error> {
@@ -177,7 +224,7 @@ impl DB {
 
     pub fn flush(&self) -> Result<(), rocksdb::Error> {
         let opts = rocksdb::FlushOptions::new();
-        for cf in COLUMN_FAMILIES {
+        for cf in column_families(self.silent_payments) {
             self.db.flush_cf_opt(self.cf(cf), &opts)?;
         }
         Ok(())
@@ -186,7 +233,7 @@ impl DB {
     pub fn start_compactions(&mut self) -> Result<(), rocksdb::Error> {
         if !self.compacting {
             const OPTION: (&str, &str) = ("disable_auto_compactions", "false");
-            for &cf_name in COLUMN_FAMILIES {
+            for cf_name in column_families(self.silent_payments) {
                 let cf = self.cf(cf_name);
                 self.db.set_options_cf(cf, &[OPTION])?;
             }
@@ -315,5 +362,68 @@ impl DB {
             result.push(row)
         }
         Ok(result)
+    }
+}
+
+fn silent_payments_key(height: u32, hash: bitcoin::BlockHash) -> [u8; 36] {
+    use bitcoin::hashes::Hash;
+    let mut key = [0; 36];
+    key[..4].copy_from_slice(&height.to_be_bytes());
+    key[4..].copy_from_slice(hash.as_byte_array());
+    key
+}
+
+fn canonical_key(height: u32) -> [u8; 4] {
+    height.to_be_bytes()
+}
+
+#[derive(Clone)]
+pub struct SilentPaymentsReader(Arc<rocksdb::DB>);
+
+#[derive(Debug, thiserror::Error)]
+pub enum SilentPaymentsReadError {
+    #[error("chain anchor has changed")]
+    StaleAnchor,
+    #[error("silent payments block data is not available")]
+    Unavailable,
+    #[error("invalid Silent Payments record")]
+    Corrupt,
+    #[error(transparent)]
+    Database(#[from] rocksdb::Error),
+    #[error(transparent)]
+    Decode(#[from] index::Error),
+}
+
+impl SilentPaymentsReader {
+    /// Read the anchor, block identity and rows from the same RocksDB view.
+    pub fn anchored_block(
+        &self,
+        height: u32,
+        end_height: u32,
+        end_hash: bitcoin::BlockHash,
+    ) -> Result<(bitcoin::BlockHash, Vec<crate::SilentPaymentEntry>), SilentPaymentsReadError> {
+        if height > end_height {
+            return Err(SilentPaymentsReadError::Unavailable);
+        }
+        let cf = self.0.cf_handle(SILENT_PAYMENTS_CF).expect("enabled index");
+        let snapshot = self.0.snapshot();
+        let block_hash = |height| {
+            let raw = snapshot
+                .get_cf(cf, canonical_key(height))?
+                .ok_or(SilentPaymentsReadError::Unavailable)?;
+            let hash = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| SilentPaymentsReadError::Corrupt)?;
+            Ok::<_, SilentPaymentsReadError>(bitcoin::BlockHash::from_byte_array(hash))
+        };
+        if block_hash(end_height)? != end_hash {
+            return Err(SilentPaymentsReadError::StaleAnchor);
+        }
+        let hash = block_hash(height)?;
+        let row = snapshot
+            .get_cf(cf, silent_payments_key(height, hash))?
+            .ok_or(SilentPaymentsReadError::Unavailable)?;
+        Ok((hash, index::silent_payments::decode(&row)?))
     }
 }

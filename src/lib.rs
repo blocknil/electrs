@@ -15,6 +15,7 @@ mod merkle;
 mod metrics;
 mod server;
 mod signals;
+mod silent_payments;
 mod status;
 mod thread;
 mod tracker;

@@ -11,7 +11,9 @@ mod headers;
 mod index;
 
 pub use chain::{IndexedChain, ScriptHashPageEntry};
+pub use db::{SilentPaymentsReadError, SilentPaymentsReader};
 pub use headers::Headers;
+pub use index::silent_payments::{SilentPaymentEntry, SilentPaymentOutput};
 pub use index::ScriptHash;
 
 #[derive(PartialEq, Eq, PartialOrd, Clone, Copy, Debug)]
